@@ -21,6 +21,7 @@ use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use object_store_opendal::OpendalStore;
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +78,8 @@ pub enum ObjectStoreScheme {
     MicrosoftAzure,
     /// Url corresponding to [`HttpStore`](crate::http::HttpStore)
     Http,
+    /// Url corresponding to Aliyun OSS via [`OpendalStore`]
+    AliyunOss,
 }
 
 impl ObjectStoreScheme {
@@ -113,6 +116,7 @@ impl ObjectStoreScheme {
             ("gs", Some(_)) => (Self::GoogleCloudStorage, url.path()),
             ("az", Some(_)) => (Self::MicrosoftAzure, strip_bucket().unwrap_or_default()),
             ("adl" | "azure" | "abfs" | "abfss", Some(_)) => (Self::MicrosoftAzure, url.path()),
+            ("oss", Some(_)) => (Self::AliyunOss, url.path()),
             ("http", Some(_)) => (Self::Http, url.path()),
             ("https", Some(host)) => {
                 if host.ends_with("dfs.core.windows.net")
@@ -128,6 +132,8 @@ impl ObjectStoreScheme {
                     }
                 } else if host.ends_with("r2.cloudflarestorage.com") {
                     (Self::AmazonS3, strip_bucket().unwrap_or_default())
+                } else if host.ends_with("aliyuncs.com") {
+                    (Self::AliyunOss, strip_bucket().unwrap_or_default())
                 } else {
                     (Self::Http, url.path())
                 }
@@ -212,6 +218,69 @@ where
                 },
             );
             Box::new(builder.build()?)
+        }
+        ObjectStoreScheme::AliyunOss => {
+            use opendal::services::Oss;
+            use opendal::Operator;
+            
+            let mut builder = Oss::default();
+            
+            // Parse URL to extract bucket and endpoint
+            let mut url_bucket = None;
+            let mut url_endpoint = None;
+            
+            if let Some(host) = url.host_str() {
+                // For oss://bucket.endpoint/path format
+                if host.contains('.') {
+                    if let Some((bucket, endpoint)) = host.split_once('.') {
+                        url_bucket = Some(bucket.to_string());
+                        url_endpoint = Some(format!("https://{}", endpoint));
+                    }
+                } else {
+                    // For oss://bucket/path format, use default endpoint
+                    url_bucket = Some(host.to_string());
+                    url_endpoint = Some("https://oss-cn-hangzhou.aliyuncs.com".to_string());
+                }
+            }
+            
+            // Set bucket from URL (always from URL)
+            if let Some(bucket) = &url_bucket {
+                builder = builder.bucket(bucket);
+            }
+            
+            // Apply configuration options (credentials and optional endpoint override)
+            let mut config_endpoint = None;
+            
+            for (key, value) in options {
+                match key.as_ref() {
+                    // Handle prefixed environment variables (oss_access_key_id, etc.)
+                    "oss_access_key_id" | "access_key_id" => builder = builder.access_key_id(&value.into()),
+                    "oss_access_key_secret" | "access_key_secret" => builder = builder.access_key_secret(&value.into()),
+                    // Store endpoint from config for potential override
+                    "oss_endpoint" | "endpoint" => config_endpoint = Some(value.into()),
+                    // Ignore bucket and region from config - they should come from URL
+                    "oss_bucket" | "bucket" | "oss_region" | "region" => {},
+                    _ => {}, // Ignore unknown options
+                }
+            }
+            
+            // Set endpoint - configuration takes priority, then URL, then default
+            if let Some(endpoint) = config_endpoint {
+                // Use configured endpoint (highest priority)
+                builder = builder.endpoint(&endpoint);
+            } else if let Some(endpoint) = &url_endpoint {
+                // Use URL-derived endpoint (fallback)
+                builder = builder.endpoint(endpoint);
+            } else {
+                // Use default endpoint (last resort)
+                builder = builder.endpoint("https://oss-cn-hangzhou.aliyuncs.com");
+            }
+            
+            let op = Operator::new(builder).map_err(|e| object_store::Error::Generic {
+                store: "AliyunOss",
+                source: Box::new(e),
+            })?.finish();
+            Box::new(OpendalStore::new(op))
         }
         s => {
             return Err(object_store::Error::Generic {

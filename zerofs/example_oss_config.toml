@@ -1,0 +1,31 @@
+# ZeroFS Configuration with Aliyun OSS
+# Example configuration file demonstrating Aliyun OSS support
+
+[cache]
+dir = "${HOME}/.cache/zerofs"
+disk_size_gb = 10.0
+memory_size_gb = 1.0
+
+[storage]
+url = "oss://my-bucket/zerofs-data"
+encryption_password = "${ZEROFS_PASSWORD}"
+
+[servers]
+nfs = { addresses = ["127.0.0.1:2049"] }
+ninep = { addresses = ["127.0.0.1:5564"], unix_socket = "/tmp/zerofs.9p.sock" }
+nbd = { addresses = ["127.0.0.1:10809"], unix_socket = "/tmp/zerofs.nbd.sock" }
+rpc = { addresses = ["127.0.0.1:7000"], unix_socket = "/tmp/zerofs.rpc.sock" }
+
+# Aliyun OSS configuration
+[oss]
+access_key_id = "${OSS_ACCESS_KEY_ID}"
+access_key_secret = "${OSS_ACCESS_KEY_SECRET}"
+# Optional: endpoint will be auto-detected from URL, but can be overridden
+# endpoint = "https://oss-cn-hangzhou.aliyuncs.com"
+# Optional: bucket will be auto-detected from URL, but can be overridden  
+# bucket = "my-bucket"
+
+# Alternative URL formats supported:
+# - oss://bucket.endpoint/path (endpoint auto-detected)
+# - oss://bucket/path (uses default endpoint)
+# - https://bucket.oss-cn-hangzhou.aliyuncs.com/path
