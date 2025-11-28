@@ -452,8 +452,6 @@ impl Settings {
         toml_string.push_str("# storage_account_name = \"${AZURE_STORAGE_ACCOUNT_NAME}\"\n");
         toml_string.push_str("# storage_account_key = \"${AZURE_STORAGE_ACCOUNT_KEY}\"\n");
 
-        toml_string.push_str("\n# Optional Aliyun OSS settings can be added to [oss] section\n");
-
         toml_string.push_str("\n# Optional GCS (Google Cloud Storage) settings\n");
         toml_string.push_str("# Use gs:// URLs with the [gcp] section\n");
 
