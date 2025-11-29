@@ -58,7 +58,7 @@ pub struct Fid {
     pub creds: Credentials, // Store credentials per fid/session
     // For directory reads: track position for sequential reads
     pub dir_last_offset: u64, // Last offset we returned entries for
-    pub dir_last_cookie: u64, // Last cookie from process_readdir for continuation
+    pub dir_last_cookie: u64, // Last cookie from readdir for continuation
 }
 
 #[derive(Debug)]
@@ -211,7 +211,7 @@ impl NinePHandler {
             groups_count: 1,
         };
 
-        let root_inode = match self.filesystem.load_inode(0).await {
+        let root_inode = match self.filesystem.get_inode_cached(0).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
@@ -254,7 +254,7 @@ impl NinePHandler {
             let name_bytes = Bytes::copy_from_slice(&wname.data);
             current_path.push(name_bytes.clone());
 
-            let inode = match self.filesystem.load_inode(current_id).await {
+            let inode = match self.filesystem.get_inode_cached(current_id).await {
                 Ok(i) => i,
                 Err(e) => return P9Message::error(tag, e.to_errno()),
             };
@@ -264,11 +264,12 @@ impl NinePHandler {
                     let creds = src_fid.creds;
                     match self
                         .filesystem
-                        .process_lookup(&creds, current_id, &name_bytes)
+                        .lookup(&creds, current_id, &name_bytes)
                         .await
                     {
                         Ok(child_id) => {
-                            let child_inode = match self.filesystem.load_inode(child_id).await {
+                            let child_inode = match self.filesystem.get_inode_cached(child_id).await
+                            {
                                 Ok(i) => i,
                                 Err(e) => {
                                     return P9Message::error(tag, e.to_errno());
@@ -333,7 +334,7 @@ impl NinePHandler {
             tl.fid, inode_id, creds.uid, creds.gid, tl.flags
         );
 
-        let inode = match self.filesystem.load_inode(inode_id).await {
+        let inode = match self.filesystem.get_inode_cached(inode_id).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
@@ -374,7 +375,7 @@ impl NinePHandler {
 
         let mut entries_to_return: Vec<(u64, Vec<u8>, u64)> = Vec::new();
 
-        let parent_id = match self.filesystem.load_inode(fid_entry.inode_id).await {
+        let parent_id = match self.filesystem.get_inode_cached(fid_entry.inode_id).await {
             Ok(Inode::Directory(dir)) => {
                 if fid_entry.inode_id == 0 {
                     0
@@ -425,7 +426,7 @@ impl NinePHandler {
 
             match self
                 .filesystem
-                .process_readdir_lite(&(&auth).into(), fid_entry.inode_id, cookie, BATCH_SIZE)
+                .readdir_lite(&(&auth).into(), fid_entry.inode_id, cookie, BATCH_SIZE)
                 .await
             {
                 Ok(result) => {
@@ -485,13 +486,14 @@ impl NinePHandler {
 
         for (offset, name, _) in &entries_to_return {
             let (child_id, child_inode) = if name.as_slice() == b"." {
-                let inode = match self.filesystem.load_inode(fid_entry.inode_id).await {
+                let inode = match self.filesystem.get_inode_cached(fid_entry.inode_id).await {
                     Ok(i) => i,
                     Err(_) => continue,
                 };
                 (fid_entry.inode_id, inode)
             } else if name.as_slice() == b".." {
-                let current_inode = match self.filesystem.load_inode(fid_entry.inode_id).await {
+                let current_inode = match self.filesystem.get_inode_cached(fid_entry.inode_id).await
+                {
                     Ok(i) => i,
                     Err(_) => continue,
                 };
@@ -505,7 +507,7 @@ impl NinePHandler {
                     }
                     _ => unreachable!("readdir called on non-directory"),
                 };
-                let parent_inode = match self.filesystem.load_inode(parent_id).await {
+                let parent_inode = match self.filesystem.get_inode_cached(parent_id).await {
                     Ok(i) => i,
                     Err(_) => continue,
                 };
@@ -515,11 +517,11 @@ impl NinePHandler {
                 let creds = Credentials::from_auth_context(&auth_ctx);
                 match self
                     .filesystem
-                    .process_lookup(&creds, fid_entry.inode_id, name.as_slice())
+                    .lookup(&creds, fid_entry.inode_id, name.as_slice())
                     .await
                 {
                     Ok(real_id) => {
-                        let inode = match self.filesystem.load_inode(real_id).await {
+                        let inode = match self.filesystem.get_inode_cached(real_id).await {
                             Ok(i) => i,
                             Err(_) => continue,
                         };
@@ -581,7 +583,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_create(
+            .create(
                 &temp_creds,
                 parent_fid.inode_id,
                 &tc.name.data,
@@ -595,7 +597,7 @@ impl NinePHandler {
             .await
         {
             Ok((child_id, _post_attr)) => {
-                let child_inode = match self.filesystem.load_inode(child_id).await {
+                let child_inode = match self.filesystem.get_inode_cached(child_id).await {
                     Ok(i) => i,
                     Err(e) => return P9Message::error(tag, e.to_errno()),
                 };
@@ -638,7 +640,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_read_file(&(&auth).into(), fid_entry.inode_id, tr.offset, tr.count)
+            .read_file(&(&auth).into(), fid_entry.inode_id, tr.offset, tr.count)
             .await
         {
             Ok((data, _eof)) => P9Message::new(
@@ -678,7 +680,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_write(&(&auth).into(), fid_entry.inode_id, tw.offset, &data)
+            .write(&(&auth).into(), fid_entry.inode_id, tw.offset, &data)
             .await
         {
             Ok(_post_attr) => {
@@ -703,7 +705,7 @@ impl NinePHandler {
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
-        match self.filesystem.load_inode(fid_entry.inode_id).await {
+        match self.filesystem.get_inode_cached(fid_entry.inode_id).await {
             Ok(inode) => P9Message::new(
                 tag,
                 Message::Rgetattr(Rgetattr {
@@ -767,11 +769,7 @@ impl NinePHandler {
             },
         };
 
-        match self
-            .filesystem
-            .process_setattr(&creds, inode_id, &attr)
-            .await
-        {
+        match self.filesystem.setattr(&creds, inode_id, &attr).await {
             Ok(_post_attr) => P9Message::new(tag, Message::Rsetattr(Rsetattr)),
             Err(e) => P9Message::error(tag, e.to_errno()),
         }
@@ -796,7 +794,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_mkdir(
+            .mkdir(
                 &temp_creds,
                 parent_id,
                 &tm.name.data,
@@ -810,7 +808,7 @@ impl NinePHandler {
             .await
         {
             Ok((new_id, _post_attr)) => {
-                let new_inode = match self.filesystem.load_inode(new_id).await {
+                let new_inode = match self.filesystem.get_inode_cached(new_id).await {
                     Ok(i) => i,
                     Err(e) => return P9Message::error(tag, e.to_errno()),
                 };
@@ -836,7 +834,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_symlink(
+            .symlink(
                 &temp_creds,
                 parent_id,
                 &ts.name.data,
@@ -851,7 +849,7 @@ impl NinePHandler {
             .await
         {
             Ok((new_id, _post_attr)) => {
-                let new_inode = match self.filesystem.load_inode(new_id).await {
+                let new_inode = match self.filesystem.get_inode_cached(new_id).await {
                     Ok(i) => i,
                     Err(e) => return P9Message::error(tag, e.to_errno()),
                 };
@@ -883,7 +881,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_mknod(
+            .mknod(
                 &temp_creds,
                 parent_fid.inode_id,
                 &tm.name.data,
@@ -902,7 +900,7 @@ impl NinePHandler {
             .await
         {
             Ok((child_id, _post_attr)) => {
-                let child_inode = match self.filesystem.load_inode(child_id).await {
+                let child_inode = match self.filesystem.get_inode_cached(child_id).await {
                     Ok(i) => i,
                     Err(e) => return P9Message::error(tag, e.to_errno()),
                 };
@@ -924,7 +922,7 @@ impl NinePHandler {
             None => return P9Message::error(tag, libc::EBADF as u32),
         };
 
-        let inode = match self.filesystem.load_inode(fid_entry.inode_id).await {
+        let inode = match self.filesystem.get_inode_cached(fid_entry.inode_id).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
@@ -968,7 +966,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_link(&(&auth).into(), file_id, dir_id, name_bytes)
+            .link(&(&auth).into(), file_id, dir_id, name_bytes)
             .await
         {
             Ok(_post_attr) => P9Message::new(tag, Message::Rlink(Rlink)),
@@ -1000,11 +998,7 @@ impl NinePHandler {
 
         let mut source_parent_id = 0;
         for name in &source_parent_path {
-            match self
-                .filesystem
-                .process_lookup(&creds, source_parent_id, name)
-                .await
-            {
+            match self.filesystem.lookup(&creds, source_parent_id, name).await {
                 Ok(real_id) => {
                     source_parent_id = real_id;
                 }
@@ -1018,7 +1012,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_rename(
+            .rename(
                 &(&auth).into(),
                 source_parent_id,
                 source_name,
@@ -1049,7 +1043,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_rename(
+            .rename(
                 &(&auth).into(),
                 old_dir_fid.inode_id,
                 &tr.oldname.data,
@@ -1074,14 +1068,14 @@ impl NinePHandler {
 
         let child_id = match self
             .filesystem
-            .process_lookup(&creds, parent_id, &tu.name.data)
+            .lookup(&creds, parent_id, &tu.name.data)
             .await
         {
             Ok(id) => id,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
 
-        let child_inode = match self.filesystem.load_inode(child_id).await {
+        let child_inode = match self.filesystem.get_inode_cached(child_id).await {
             Ok(i) => i,
             Err(e) => return P9Message::error(tag, e.to_errno()),
         };
@@ -1102,7 +1096,7 @@ impl NinePHandler {
 
         match self
             .filesystem
-            .process_remove(&(&auth).into(), parent_id, &tu.name.data)
+            .remove(&(&auth).into(), parent_id, &tu.name.data)
             .await
         {
             Ok(_) => P9Message::new(tag, Message::Runlinkat(Runlinkat)),
@@ -1115,7 +1109,7 @@ impl NinePHandler {
             return P9Message::error(tag, libc::EBADF as u32);
         }
 
-        match self.filesystem.flush().await {
+        match self.filesystem.flush_coordinator.flush().await {
             Ok(_) => P9Message::new(tag, Message::Rfsync(Rfsync)),
             Err(e) => P9Message::error(tag, e.to_errno()),
         }
@@ -1137,10 +1131,7 @@ impl NinePHandler {
         let used_blocks = used_bytes.div_ceil(BLOCK_SIZE as u64);
         let free_blocks = total_blocks.saturating_sub(used_blocks);
 
-        let next_inode_id = self
-            .filesystem
-            .next_inode_id
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let next_inode_id = self.filesystem.inode_store.next_id();
 
         let available_inodes = TOTAL_INODES.saturating_sub(next_inode_id);
 
@@ -1583,10 +1574,7 @@ mod tests {
                 // Should have fewer available inodes since we allocated one for the file
                 // Note: Available inodes are based on next_inode_id, not currently used inodes
                 const TOTAL_INODES: u64 = 1 << 48;
-                let next_inode_id = handler
-                    .filesystem
-                    .next_inode_id
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let next_inode_id = handler.filesystem.inode_store.next_id();
                 assert_eq!(rstatfs.ffree, TOTAL_INODES - next_inode_id);
 
                 // Should have fewer free blocks (10KB written = 3 blocks of 4KB)
@@ -1608,7 +1596,7 @@ mod tests {
             groups_count: 1,
         };
         for i in 0..10 {
-            fs.process_create(
+            fs.create(
                 &creds,
                 0,
                 format!("file{i:02}.txt").as_bytes(),
@@ -1694,7 +1682,7 @@ mod tests {
             groups_count: 1,
         };
         for i in 0..5 {
-            fs.process_create(
+            fs.create(
                 &creds,
                 0,
                 format!("file{i}.txt").as_bytes(),
@@ -1771,7 +1759,7 @@ mod tests {
         };
 
         for i in 0..1002 {
-            fs.process_create(
+            fs.create(
                 &creds,
                 0,
                 format!("file_{:06}.txt", i).as_bytes(),
@@ -1926,7 +1914,7 @@ mod tests {
             groups_count: 1,
         };
         let (_empty_dir_id, _) = fs
-            .process_mkdir(&creds, 0, b"emptydir", &SetAttributes::default())
+            .mkdir(&creds, 0, b"emptydir", &SetAttributes::default())
             .await
             .unwrap();
 

@@ -89,16 +89,14 @@ impl EncryptionManager {
     }
 }
 
-// Encrypted WriteBatch wrapper
-pub struct EncryptedWriteBatch {
+pub struct EncryptedTransaction {
     inner: WriteBatch,
     encryptor: Arc<EncryptionManager>,
-    // Queue of cache operations to apply after successful write
-    cache_ops: Vec<(Bytes, Option<Bytes>)>, // (key, Some(value) for put, None for delete)
+    cache_ops: Vec<(Bytes, Option<Bytes>)>,
     pending_operations: Vec<(Bytes, Bytes)>,
 }
 
-impl EncryptedWriteBatch {
+impl EncryptedTransaction {
     pub fn new(encryptor: Arc<EncryptionManager>) -> Self {
         Self {
             inner: WriteBatch::new(),
@@ -109,11 +107,9 @@ impl EncryptedWriteBatch {
     }
 
     pub fn put_bytes(&mut self, key: &bytes::Bytes, value: Bytes) {
-        // Queue cache operation if this is a chunk
         if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
             self.cache_ops.push((key.clone(), Some(value.clone())));
         }
-
         self.pending_operations.push((key.clone(), value));
     }
 
@@ -121,7 +117,6 @@ impl EncryptedWriteBatch {
         if key.first().and_then(|&b| KeyPrefix::try_from(b).ok()) == Some(KeyPrefix::Chunk) {
             self.cache_ops.push((key.clone(), None));
         }
-
         self.inner.delete(key);
     }
 
@@ -292,14 +287,14 @@ impl EncryptedDb {
 
     pub async fn write_with_options(
         &self,
-        batch: EncryptedWriteBatch,
+        txn: EncryptedTransaction,
         options: &WriteOptions,
     ) -> Result<()> {
         if self.is_read_only() {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
 
-        let (inner_batch, _cache_ops) = batch.into_inner().await?;
+        let (inner_batch, _cache_ops) = txn.into_inner().await?;
 
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => db.write_with_options(inner_batch, options).await?,
@@ -324,11 +319,11 @@ impl EncryptedDb {
         Ok(())
     }
 
-    pub fn new_write_batch(&self) -> Result<EncryptedWriteBatch> {
+    pub fn new_transaction(&self) -> Result<EncryptedTransaction, FsError> {
         if self.is_read_only() {
-            return Err(FsError::ReadOnlyFilesystem.into());
+            return Err(FsError::ReadOnlyFilesystem);
         }
-        Ok(EncryptedWriteBatch::new(self.encryptor.clone()))
+        Ok(EncryptedTransaction::new(self.encryptor.clone()))
     }
 
     pub async fn put_with_options(

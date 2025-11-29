@@ -4,7 +4,7 @@ use crate::config::{NbdConfig, NfsConfig, NinePConfig, RpcConfig, Settings};
 use crate::encryption::SlateDbHandle;
 use crate::fs::permissions::Credentials;
 use crate::fs::types::SetAttributes;
-use crate::fs::{CacheConfig, ZeroFS};
+use crate::fs::{CacheConfig, GarbageCollector, ZeroFS};
 use crate::key_management;
 use crate::nbd::NBDServer;
 use crate::parse_object_store::parse_url_opts;
@@ -127,7 +127,7 @@ async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
     };
     let nbd_name = b".nbd";
 
-    match fs.process_lookup(&creds, 0, nbd_name).await {
+    match fs.lookup(&creds, 0, nbd_name).await {
         Ok(_) => info!(".nbd directory already exists"),
         Err(_) => {
             let attr = SetAttributes {
@@ -136,7 +136,7 @@ async fn ensure_nbd_directory(fs: &Arc<ZeroFS>) -> Result<()> {
                 gid: crate::fs::types::SetGid::Set(0),
                 ..Default::default()
             };
-            fs.process_mkdir(&creds, 0, nbd_name, &attr)
+            fs.mkdir(&creds, 0, nbd_name, &attr)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to create .nbd directory: {e:?}"))?;
             info!("Created .nbd directory for NBD device management");
@@ -232,18 +232,6 @@ async fn start_rpc_servers(
     handles
 }
 
-fn start_garbage_collection(fs: Arc<ZeroFS>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        info!("Starting garbage collection task (runs continuously)");
-        loop {
-            if let Err(e) = fs.run_garbage_collection().await {
-                tracing::error!("Garbage collection failed: {:?}", e);
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        }
-    })
-}
-
 fn start_stats_reporting(fs: Arc<ZeroFS>) -> JoinHandle<()> {
     tokio::spawn(async move {
         info!("Starting stats reporting task (reports to debug every 5 seconds)");
@@ -264,7 +252,7 @@ fn start_periodic_flush(fs: Arc<ZeroFS>, interval_secs: u64) -> JoinHandle<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         loop {
             interval.tick().await;
-            if let Err(e) = fs.flush().await {
+            if let Err(e) = fs.flush_coordinator.flush().await {
                 tracing::error!("Periodic flush failed: {:?}", e);
             }
         }
@@ -641,7 +629,13 @@ pub async fn run_server(
     let rpc_handles = start_rpc_servers(settings.servers.rpc.as_ref(), checkpoint_manager).await;
 
     let gc_handle = if !db_mode.is_read_only() {
-        Some(start_garbage_collection(Arc::clone(&fs)))
+        let gc = Arc::new(GarbageCollector::new(
+            Arc::clone(&fs.db),
+            fs.tombstone_store.clone(),
+            fs.chunk_store.clone(),
+            Arc::clone(&fs.stats),
+        ));
+        Some(gc.start())
     } else {
         None
     };
@@ -693,14 +687,14 @@ pub async fn run_server(
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, shutting down gracefully...");
             if !db_mode.is_read_only() {
-                fs.flush().await?;
+                fs.flush_coordinator.flush().await?;
             }
             fs.db.close().await?;
         }
         _ = sigterm.recv() => {
             info!("Received SIGTERM, shutting down gracefully...");
             if !db_mode.is_read_only() {
-                fs.flush().await?;
+                fs.flush_coordinator.flush().await?;
             }
             fs.db.close().await?;
         }

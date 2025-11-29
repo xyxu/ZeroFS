@@ -136,14 +136,13 @@ impl FileSystemGlobalStats {
         })
     }
 
-    /// Add the statistics update to a write batch
-    pub fn add_to_batch(
+    pub fn add_to_transaction(
         &self,
         update: &StatsUpdate,
-        batch: &mut crate::encryption::EncryptedWriteBatch,
+        txn: &mut crate::encryption::EncryptedTransaction,
     ) -> Result<(), FsError> {
         let shard_bytes = bincode::serialize(&update.shard_data)?;
-        batch.put_bytes(&update.shard_key, Bytes::from(shard_bytes));
+        txn.put_bytes(&update.shard_key, Bytes::from(shard_bytes));
 
         Ok(())
     }
@@ -214,7 +213,7 @@ mod tests {
 
         // Create a file
         let (_file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -231,13 +230,13 @@ mod tests {
 
         // Create a file
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         // Write 1000 bytes
         let data = vec![0u8; 1000];
-        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+        fs.write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
@@ -247,7 +246,7 @@ mod tests {
 
         // Write more data (extending the file)
         let data = vec![1u8; 500];
-        fs.process_write(&auth, file_id, 1000, &Bytes::copy_from_slice(&data))
+        fs.write(&auth, file_id, 1000, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
@@ -264,18 +263,18 @@ mod tests {
 
         // Create a file and write initial data
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = vec![0u8; 1000];
-        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+        fs.write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
         // Overwrite part of the file (no size change)
         let data = vec![1u8; 500];
-        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+        fs.write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
@@ -292,14 +291,14 @@ mod tests {
 
         // Create a file
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"sparse.txt", &SetAttributes::default())
+            .create(&creds, 0, b"sparse.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         // Write 1 byte at offset 1GB (creating a sparse file)
         let data = vec![42u8; 1];
         let offset = 1_000_000_000;
-        fs.process_write(&auth, file_id, offset, &Bytes::copy_from_slice(&data))
+        fs.write(&auth, file_id, offset, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
@@ -316,12 +315,12 @@ mod tests {
 
         // Create and write to a file
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = vec![0u8; 5000];
-        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+        fs.write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
@@ -330,9 +329,7 @@ mod tests {
         assert_eq!(inodes, 1);
 
         // Remove the file
-        fs.process_remove(&test_auth(), 0, b"test.txt")
-            .await
-            .unwrap();
+        fs.remove(&test_auth(), 0, b"test.txt").await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 0);
@@ -345,12 +342,12 @@ mod tests {
 
         // Create directories
         let (dir1_id, _) = fs
-            .process_mkdir(&test_creds(), 0, b"dir1", &SetAttributes::default())
+            .mkdir(&test_creds(), 0, b"dir1", &SetAttributes::default())
             .await
             .unwrap();
 
         let (_dir2_id, _) = fs
-            .process_mkdir(&test_creds(), dir1_id, b"dir2", &SetAttributes::default())
+            .mkdir(&test_creds(), dir1_id, b"dir2", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -365,7 +362,7 @@ mod tests {
 
         // Create a symlink
         let (_link_id, _) = fs
-            .process_symlink(
+            .symlink(
                 &test_creds(),
                 0,
                 b"link",
@@ -386,17 +383,17 @@ mod tests {
 
         // Create a file with content
         let (file_id, _) = fs
-            .process_create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
+            .create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = vec![0u8; 1000];
-        fs.process_write(&test_auth(), file_id, 0, &Bytes::copy_from_slice(&data))
+        fs.write(&test_auth(), file_id, 0, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
         // Create a hard link
-        fs.process_link(&test_auth(), file_id, 0, b"hardlink.txt")
+        fs.link(&test_auth(), file_id, 0, b"hardlink.txt")
             .await
             .unwrap();
 
@@ -405,18 +402,14 @@ mod tests {
         assert_eq!(inodes, 1); // Still just 2 inodes (root + file)
 
         // Remove original - stats should remain
-        fs.process_remove(&test_auth(), 0, b"original.txt")
-            .await
-            .unwrap();
+        fs.remove(&test_auth(), 0, b"original.txt").await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 1000); // Data still exists via hard link
         assert_eq!(inodes, 1);
 
         // Remove hard link - now stats should update
-        fs.process_remove(&test_auth(), 0, b"hardlink.txt")
-            .await
-            .unwrap();
+        fs.remove(&test_auth(), 0, b"hardlink.txt").await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 0);
@@ -429,12 +422,12 @@ mod tests {
 
         // Create a file with content
         let (file_id, _) = fs
-            .process_create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
+            .create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = vec![0u8; 10000];
-        fs.process_write(&test_auth(), file_id, 0, &Bytes::copy_from_slice(&data))
+        fs.write(&test_auth(), file_id, 0, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
@@ -446,9 +439,7 @@ mod tests {
             ..Default::default()
         };
 
-        fs.process_setattr(&test_creds(), file_id, &setattr)
-            .await
-            .unwrap();
+        fs.setattr(&test_creds(), file_id, &setattr).await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 5000);
@@ -460,9 +451,7 @@ mod tests {
             ..Default::default()
         };
 
-        fs.process_setattr(&test_creds(), file_id, &setattr)
-            .await
-            .unwrap();
+        fs.setattr(&test_creds(), file_id, &setattr).await.unwrap();
 
         let (bytes, inodes) = fs.global_stats.get_totals();
         assert_eq!(bytes, 15000);
@@ -483,14 +472,14 @@ mod tests {
                 let creds = test_creds();
                 let auth = test_auth();
                 let (file_id, _) = fs_clone
-                    .process_create(&creds, 0, fname.as_bytes(), &SetAttributes::default())
+                    .create(&creds, 0, fname.as_bytes(), &SetAttributes::default())
                     .await
                     .unwrap();
 
                 // Write different amounts of data
                 let data = vec![0u8; (i + 1) * 1000];
                 fs_clone
-                    .process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+                    .write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
                     .await
                     .unwrap();
             });
@@ -540,22 +529,20 @@ mod tests {
         for i in 0..5 {
             let fname = format!("file{i}.txt");
             let (file_id, _) = fs
-                .process_create(&creds, 0, fname.as_bytes(), &SetAttributes::default())
+                .create(&creds, 0, fname.as_bytes(), &SetAttributes::default())
                 .await
                 .unwrap();
 
             let data = vec![0u8; 1_000_000]; // 1MB each
-            fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+            fs.write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
                 .await
                 .unwrap();
         }
 
-        // Check fsstat - need to load and calculate manually
         const TOTAL_BYTES: u64 = 8 << 60; // 8 EiB
         const TOTAL_INODES: u64 = 1 << 48;
 
-        // Get the next inode ID to verify available inodes calculation
-        let next_inode_id = fs.next_inode_id.load(std::sync::atomic::Ordering::Relaxed);
+        let next_inode_id = fs.inode_store.next_id();
         let (used_bytes, used_inodes) = fs.global_stats.get_totals();
 
         let fbytes = TOTAL_BYTES - used_bytes;
@@ -574,12 +561,12 @@ mod tests {
         let auth = test_auth();
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"original.txt", &SetAttributes::default())
+            .create(&creds, 0, b"original.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = vec![0u8; 1000];
-        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+        fs.write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
@@ -588,7 +575,7 @@ mod tests {
         assert_eq!(inodes_before, 1);
 
         // Rename without replacing anything
-        fs.process_rename(&auth, 0, b"original.txt", 0, b"renamed.txt")
+        fs.rename(&auth, 0, b"original.txt", 0, b"renamed.txt")
             .await
             .unwrap();
 
@@ -603,21 +590,21 @@ mod tests {
 
         // Create source file with 1000 bytes
         let (file1_id, _) = fs
-            .process_create(&test_creds(), 0, b"source.txt", &SetAttributes::default())
+            .create(&test_creds(), 0, b"source.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data1 = vec![0u8; 1000];
-        fs.process_write(&test_auth(), file1_id, 0, &Bytes::copy_from_slice(&data1))
+        fs.write(&test_auth(), file1_id, 0, &Bytes::copy_from_slice(&data1))
             .await
             .unwrap();
 
         // Create target file with 2000 bytes
         let (file2_id, _) = fs
-            .process_create(&test_creds(), 0, b"target.txt", &SetAttributes::default())
+            .create(&test_creds(), 0, b"target.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data2 = vec![0u8; 2000];
-        fs.process_write(&test_auth(), file2_id, 0, &Bytes::copy_from_slice(&data2))
+        fs.write(&test_auth(), file2_id, 0, &Bytes::copy_from_slice(&data2))
             .await
             .unwrap();
 
@@ -626,7 +613,7 @@ mod tests {
         assert_eq!(inodes_before, 2);
 
         // Rename source over target (replacing it)
-        fs.process_rename(&test_auth(), 0, b"source.txt", 0, b"target.txt")
+        fs.rename(&test_auth(), 0, b"source.txt", 0, b"target.txt")
             .await
             .unwrap();
 
@@ -641,26 +628,26 @@ mod tests {
 
         // Create source file
         let (source_id, _) = fs
-            .process_create(&test_creds(), 0, b"source.txt", &SetAttributes::default())
+            .create(&test_creds(), 0, b"source.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data1 = vec![0u8; 500];
-        fs.process_write(&test_auth(), source_id, 0, &Bytes::copy_from_slice(&data1))
+        fs.write(&test_auth(), source_id, 0, &Bytes::copy_from_slice(&data1))
             .await
             .unwrap();
 
         // Create target file with 1500 bytes
         let (target_id, _) = fs
-            .process_create(&test_creds(), 0, b"target.txt", &SetAttributes::default())
+            .create(&test_creds(), 0, b"target.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data2 = vec![0u8; 1500];
-        fs.process_write(&test_auth(), target_id, 0, &Bytes::copy_from_slice(&data2))
+        fs.write(&test_auth(), target_id, 0, &Bytes::copy_from_slice(&data2))
             .await
             .unwrap();
 
         // Create a hard link to target
-        fs.process_link(&test_auth(), target_id, 0, b"hardlink.txt")
+        fs.link(&test_auth(), target_id, 0, b"hardlink.txt")
             .await
             .unwrap();
 
@@ -669,7 +656,7 @@ mod tests {
         assert_eq!(inodes_before, 2); // source + target (hardlink doesn't add inode)
 
         // Rename source over target (which has a hard link)
-        fs.process_rename(&test_auth(), 0, b"source.txt", 0, b"target.txt")
+        fs.rename(&test_auth(), 0, b"source.txt", 0, b"target.txt")
             .await
             .unwrap();
 
@@ -678,7 +665,7 @@ mod tests {
         assert_eq!(inodes_after, 2); // Both inodes remain
 
         // Verify hardlink still works
-        let inode = fs.load_inode(target_id).await.unwrap();
+        let inode = fs.inode_store.get(target_id).await.unwrap();
         let attrs: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &inode,
             id: target_id,
@@ -693,13 +680,13 @@ mod tests {
 
         // Create source directory
         let (_source_dir_id, _) = fs
-            .process_mkdir(&test_creds(), 0, b"sourcedir", &SetAttributes::default())
+            .mkdir(&test_creds(), 0, b"sourcedir", &SetAttributes::default())
             .await
             .unwrap();
 
         // Create target directory (must be empty to be replaceable)
         let (_target_dir_id, _) = fs
-            .process_mkdir(&test_creds(), 0, b"targetdir", &SetAttributes::default())
+            .mkdir(&test_creds(), 0, b"targetdir", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -708,7 +695,7 @@ mod tests {
         assert_eq!(inodes_before, 2); // Two directories
 
         // Rename source directory over target directory
-        fs.process_rename(&test_auth(), 0, b"sourcedir", 0, b"targetdir")
+        fs.rename(&test_auth(), 0, b"sourcedir", 0, b"targetdir")
             .await
             .unwrap();
 
@@ -725,17 +712,17 @@ mod tests {
 
         // Create a file to rename
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"file.txt", &SetAttributes::default())
+            .create(&creds, 0, b"file.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data = vec![0u8; 750];
-        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+        fs.write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
         // Create a symlink
         let (_link_id, _) = fs
-            .process_symlink(
+            .symlink(
                 &creds,
                 0,
                 b"link",
@@ -750,9 +737,7 @@ mod tests {
         assert_eq!(inodes_before, 2); // file + symlink
 
         // Rename file over symlink
-        fs.process_rename(&auth, 0, b"file.txt", 0, b"link")
-            .await
-            .unwrap();
+        fs.rename(&auth, 0, b"file.txt", 0, b"link").await.unwrap();
 
         let (bytes_after, inodes_after) = fs.global_stats.get_totals();
         assert_eq!(bytes_after, 750);
@@ -767,31 +752,31 @@ mod tests {
 
         // Create two directories
         let (dir1_id, _) = fs
-            .process_mkdir(&creds, 0, b"dir1", &SetAttributes::default())
+            .mkdir(&creds, 0, b"dir1", &SetAttributes::default())
             .await
             .unwrap();
         let (dir2_id, _) = fs
-            .process_mkdir(&creds, 0, b"dir2", &SetAttributes::default())
+            .mkdir(&creds, 0, b"dir2", &SetAttributes::default())
             .await
             .unwrap();
 
         // Create file in dir1
         let (file_id, _) = fs
-            .process_create(&creds, dir1_id, b"file.txt", &SetAttributes::default())
+            .create(&creds, dir1_id, b"file.txt", &SetAttributes::default())
             .await
             .unwrap();
         let data = vec![0u8; 1234];
-        fs.process_write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
+        fs.write(&auth, file_id, 0, &Bytes::copy_from_slice(&data))
             .await
             .unwrap();
 
         // Create another file in dir2 that will be replaced
         let (target_id, _) = fs
-            .process_create(&creds, dir2_id, b"target.txt", &SetAttributes::default())
+            .create(&creds, dir2_id, b"target.txt", &SetAttributes::default())
             .await
             .unwrap();
         let target_data = vec![0u8; 5678];
-        fs.process_write(&auth, target_id, 0, &Bytes::copy_from_slice(&target_data))
+        fs.write(&auth, target_id, 0, &Bytes::copy_from_slice(&target_data))
             .await
             .unwrap();
 
@@ -800,7 +785,7 @@ mod tests {
         assert_eq!(inodes_before, 4); // 2 dirs + 2 files
 
         // Rename file from dir1 to dir2, replacing target
-        fs.process_rename(&auth, dir1_id, b"file.txt", dir2_id, b"target.txt")
+        fs.rename(&auth, dir1_id, b"file.txt", dir2_id, b"target.txt")
             .await
             .unwrap();
 
@@ -817,7 +802,7 @@ mod tests {
 
         // Create a FIFO
         let (_fifo_id, _) = fs
-            .process_mknod(
+            .mknod(
                 &creds,
                 0,
                 b"fifo1",
@@ -830,7 +815,7 @@ mod tests {
 
         // Create another FIFO to be replaced
         let (_fifo2_id, _) = fs
-            .process_mknod(
+            .mknod(
                 &creds,
                 0,
                 b"fifo2",
@@ -846,9 +831,7 @@ mod tests {
         assert_eq!(inodes_before, 2); // Two FIFOs
 
         // Rename fifo1 over fifo2
-        fs.process_rename(&auth, 0, b"fifo1", 0, b"fifo2")
-            .await
-            .unwrap();
+        fs.rename(&auth, 0, b"fifo1", 0, b"fifo2").await.unwrap();
 
         let (bytes_after, inodes_after) = fs.global_stats.get_totals();
         assert_eq!(bytes_after, 0);

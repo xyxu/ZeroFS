@@ -24,7 +24,7 @@ mod tests {
         let creds = test_creds();
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -37,7 +37,7 @@ mod tests {
             mtime: SetTime::NoChange,
         };
 
-        let fattr = fs.process_setattr(&creds, file_id, &setattr).await.unwrap();
+        let fattr = fs.setattr(&creds, file_id, &setattr).await.unwrap();
         assert_eq!(fattr.mode & 0o777, 0o644);
 
         let setattr = SetAttributes {
@@ -49,7 +49,7 @@ mod tests {
             mtime: SetTime::NoChange,
         };
 
-        let fattr = fs.process_setattr(&creds, file_id, &setattr).await.unwrap();
+        let fattr = fs.setattr(&creds, file_id, &setattr).await.unwrap();
         assert_eq!(fattr.mode & 0o7777, 0o7755);
     }
 
@@ -59,7 +59,7 @@ mod tests {
         let creds = test_creds();
 
         let (dir_id, fattr) = fs
-            .process_mkdir(&creds, 0, b"testdir", &SetAttributes::default())
+            .mkdir(&creds, 0, b"testdir", &SetAttributes::default())
             .await
             .unwrap();
         assert_eq!(
@@ -72,15 +72,15 @@ mod tests {
             mode: SetMode::Set(0o1777),
             ..Default::default()
         };
-        fs.process_setattr(&creds, dir_id, &setattr).await.unwrap();
+        fs.setattr(&creds, dir_id, &setattr).await.unwrap();
 
         let setattr = SetAttributes {
             mode: SetMode::Set(0o755),
             ..Default::default()
         };
-        fs.process_setattr(&creds, dir_id, &setattr).await.unwrap();
+        fs.setattr(&creds, dir_id, &setattr).await.unwrap();
 
-        let parent_inode = fs.load_inode(dir_id).await.unwrap();
+        let parent_inode = fs.inode_store.get(dir_id).await.unwrap();
         let parent_fattr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &parent_inode,
             id: dir_id,
@@ -93,7 +93,7 @@ mod tests {
         );
 
         let (_subdir_id, subdir_fattr) = fs
-            .process_mkdir(&creds, dir_id, b"subdir", &SetAttributes::default())
+            .mkdir(&creds, dir_id, b"subdir", &SetAttributes::default())
             .await
             .unwrap();
         assert_eq!(
@@ -113,25 +113,25 @@ mod tests {
         };
 
         let (a_id, _) = fs
-            .process_mkdir(&test_creds(), 0, b"a", &SetAttributes::default())
+            .mkdir(&test_creds(), 0, b"a", &SetAttributes::default())
             .await
             .unwrap();
         let (b_id, _) = fs
-            .process_mkdir(&test_creds(), a_id, b"b", &SetAttributes::default())
+            .mkdir(&test_creds(), a_id, b"b", &SetAttributes::default())
             .await
             .unwrap();
         let (c_id, _) = fs
-            .process_mkdir(&test_creds(), b_id, b"c", &SetAttributes::default())
+            .mkdir(&test_creds(), b_id, b"c", &SetAttributes::default())
             .await
             .unwrap();
 
-        let result = fs.process_rename(&auth, 0, b"a", b_id, b"a").await;
+        let result = fs.rename(&auth, 0, b"a", b_id, b"a").await;
         assert!(result.is_err());
 
-        let result = fs.process_rename(&auth, 0, b"a", c_id, b"a").await;
+        let result = fs.rename(&auth, 0, b"a", c_id, b"a").await;
         assert!(result.is_err());
 
-        let result = fs.process_rename(&auth, a_id, b".", 0, b"dot").await;
+        let result = fs.rename(&auth, a_id, b".", 0, b"dot").await;
         assert!(result.is_err(), "Renaming '.' should fail");
     }
 
@@ -146,15 +146,15 @@ mod tests {
         };
 
         let (file1_id, _) = fs
-            .process_create(&creds, 0, b"file1", &SetAttributes::default())
+            .create(&creds, 0, b"file1", &SetAttributes::default())
             .await
             .unwrap();
         let (file2_id, _) = fs
-            .process_create(&creds, 0, b"file2", &SetAttributes::default())
+            .create(&creds, 0, b"file2", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_write(
+        fs.write(
             &auth,
             file1_id,
             0,
@@ -162,7 +162,7 @@ mod tests {
         )
         .await
         .unwrap();
-        fs.process_write(
+        fs.write(
             &auth,
             file2_id,
             0,
@@ -171,20 +171,18 @@ mod tests {
         .await
         .unwrap();
 
-        fs.process_rename(&auth, 0, b"file1", 0, b"file2")
-            .await
-            .unwrap();
+        fs.rename(&auth, 0, b"file1", 0, b"file2").await.unwrap();
 
-        let result = fs.process_lookup(&creds, 0, b"file1").await;
+        let result = fs.lookup(&creds, 0, b"file1").await;
         assert!(result.is_err());
 
-        let found_id = fs.process_lookup(&creds, 0, b"file2").await.unwrap();
+        let found_id = fs.lookup(&creds, 0, b"file2").await.unwrap();
         assert_eq!(found_id, file1_id);
 
-        let (data, _) = fs.process_read_file(&auth, found_id, 0, 100).await.unwrap();
+        let (data, _) = fs.read_file(&auth, found_id, 0, 100).await.unwrap();
         assert_eq!(data.as_ref(), b"content1");
 
-        let result = fs.load_inode(file2_id).await;
+        let result = fs.inode_store.get(file2_id).await;
         assert!(result.is_err());
     }
 
@@ -199,7 +197,7 @@ mod tests {
         };
 
         let (parent_id, _) = fs
-            .process_mkdir(&creds, 0, b"parent", &SetAttributes::default())
+            .mkdir(&creds, 0, b"parent", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -207,20 +205,16 @@ mod tests {
             mode: SetMode::Set(0o1777),
             ..Default::default()
         };
-        fs.process_setattr(&creds, parent_id, &setattr)
-            .await
-            .unwrap();
+        fs.setattr(&creds, parent_id, &setattr).await.unwrap();
 
         let (_subdir_id, _) = fs
-            .process_mkdir(&creds, parent_id, b"subdir", &SetAttributes::default())
+            .mkdir(&creds, parent_id, b"subdir", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_remove(&auth, parent_id, b"subdir")
-            .await
-            .unwrap();
+        fs.remove(&auth, parent_id, b"subdir").await.unwrap();
 
-        let result = fs.process_lookup(&creds, parent_id, b"subdir").await;
+        let result = fs.lookup(&creds, parent_id, b"subdir").await;
         assert!(result.is_err());
     }
 
@@ -235,19 +229,19 @@ mod tests {
         };
 
         let (dir_id, _) = fs
-            .process_mkdir(&creds, 0, b"dir", &SetAttributes::default())
+            .mkdir(&creds, 0, b"dir", &SetAttributes::default())
             .await
             .unwrap();
-        fs.process_create(&creds, dir_id, b"file", &SetAttributes::default())
+        fs.create(&creds, dir_id, b"file", &SetAttributes::default())
             .await
             .unwrap();
 
-        let result = fs.process_remove(&auth, 0, b"dir").await;
+        let result = fs.remove(&auth, 0, b"dir").await;
         assert!(result.is_err());
 
-        fs.process_remove(&auth, dir_id, b"file").await.unwrap();
+        fs.remove(&auth, dir_id, b"file").await.unwrap();
 
-        fs.process_remove(&auth, 0, b"dir").await.unwrap();
+        fs.remove(&auth, 0, b"dir").await.unwrap();
     }
 
     #[tokio::test]
@@ -257,7 +251,7 @@ mod tests {
 
         let target = b"/path/to/target";
         let (link_id, fattr) = fs
-            .process_symlink(&creds, 0, b"mylink", target, &SetAttributes::default())
+            .symlink(&creds, 0, b"mylink", target, &SetAttributes::default())
             .await
             .unwrap();
 
@@ -265,7 +259,7 @@ mod tests {
         assert!(matches!(fattr.file_type, FileType::Symlink));
         assert_eq!(fattr.size, target.len() as u64);
 
-        let inode = fs.load_inode(link_id).await.unwrap();
+        let inode = fs.inode_store.get(link_id).await.unwrap();
         if let crate::fs::inode::Inode::Symlink(symlink) = inode {
             assert_eq!(&symlink.target, target);
         } else {
@@ -284,11 +278,11 @@ mod tests {
         };
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_write(
+        fs.write(
             &auth,
             file_id,
             0,
@@ -297,7 +291,7 @@ mod tests {
         .await
         .unwrap();
 
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         let fattr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &inode,
             id: file_id,
@@ -310,10 +304,10 @@ mod tests {
             ..Default::default()
         };
 
-        let fattr = fs.process_setattr(&creds, file_id, &setattr).await.unwrap();
+        let fattr = fs.setattr(&creds, file_id, &setattr).await.unwrap();
         assert_eq!(fattr.size, 5);
 
-        let (data, _) = fs.process_read_file(&auth, file_id, 0, 10).await.unwrap();
+        let (data, _) = fs.read_file(&auth, file_id, 0, 10).await.unwrap();
         assert_eq!(data.as_ref(), b"Hello");
 
         let setattr = SetAttributes {
@@ -321,10 +315,10 @@ mod tests {
             ..Default::default()
         };
 
-        let fattr = fs.process_setattr(&creds, file_id, &setattr).await.unwrap();
+        let fattr = fs.setattr(&creds, file_id, &setattr).await.unwrap();
         assert_eq!(fattr.size, 10);
 
-        let (data, _) = fs.process_read_file(&auth, file_id, 0, 10).await.unwrap();
+        let (data, _) = fs.read_file(&auth, file_id, 0, 10).await.unwrap();
         assert_eq!(data.as_ref(), b"Hello\0\0\0\0\0");
     }
 
@@ -339,7 +333,7 @@ mod tests {
         };
 
         let (tmp_id, _) = fs
-            .process_mkdir(&creds, 0, b"tmp", &SetAttributes::default())
+            .mkdir(&creds, 0, b"tmp", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -347,15 +341,15 @@ mod tests {
             mode: SetMode::Set(0o1777),
             ..Default::default()
         };
-        fs.process_setattr(&creds, tmp_id, &setattr).await.unwrap();
+        fs.setattr(&creds, tmp_id, &setattr).await.unwrap();
 
-        fs.process_create(&creds, tmp_id, b"file", &SetAttributes::default())
+        fs.create(&creds, tmp_id, b"file", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_remove(&auth, tmp_id, b"file").await.unwrap();
+        fs.remove(&auth, tmp_id, b"file").await.unwrap();
 
-        let result = fs.process_lookup(&creds, tmp_id, b"file").await;
+        let result = fs.lookup(&creds, tmp_id, b"file").await;
         assert!(result.is_err());
     }
 
@@ -365,7 +359,7 @@ mod tests {
         let creds = test_creds();
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -376,7 +370,7 @@ mod tests {
         };
 
         let fattr = fs
-            .process_setattr(&creds, file_id, &server_time_setattr)
+            .setattr(&creds, file_id, &server_time_setattr)
             .await
             .unwrap();
         assert!(fattr.atime.seconds > 0);
@@ -394,7 +388,7 @@ mod tests {
         };
 
         let fattr = fs
-            .process_setattr(&creds, file_id, &client_time_setattr)
+            .setattr(&creds, file_id, &client_time_setattr)
             .await
             .unwrap();
         assert_eq!(fattr.atime.seconds, client_time.seconds);
@@ -413,15 +407,13 @@ mod tests {
         };
 
         let file_id = fs
-            .process_create_exclusive(&auth, 0, b"exclusive.txt")
+            .create_exclusive(&auth, 0, b"exclusive.txt")
             .await
             .unwrap();
 
         assert!(file_id > 0);
 
-        let result = fs
-            .process_create_exclusive(&auth, 0, b"exclusive.txt")
-            .await;
+        let result = fs.create_exclusive(&auth, 0, b"exclusive.txt").await;
         assert!(result.is_err());
     }
 
@@ -436,13 +428,13 @@ mod tests {
         };
 
         let (dir_id, _) = fs
-            .process_mkdir(&creds, 0, b"testdir", &SetAttributes::default())
+            .mkdir(&creds, 0, b"testdir", &SetAttributes::default())
             .await
             .unwrap();
 
         for i in 0..10 {
             let name = format!("file{i}");
-            fs.process_create(&creds, dir_id, name.as_bytes(), &SetAttributes::default())
+            fs.create(&creds, dir_id, name.as_bytes(), &SetAttributes::default())
                 .await
                 .unwrap();
         }
@@ -450,10 +442,7 @@ mod tests {
         let mut entries = Vec::new();
         let mut start_after = 0;
         loop {
-            let result = fs
-                .process_readdir(&auth, dir_id, start_after, 5)
-                .await
-                .unwrap();
+            let result = fs.readdir(&auth, dir_id, start_after, 5).await.unwrap();
             let _count = result.entries.len();
             entries.extend(result.entries);
 
@@ -487,20 +476,20 @@ mod tests {
         };
 
         let (dir1_id, _) = fs
-            .process_mkdir(&creds, 0, b"dir1", &SetAttributes::default())
+            .mkdir(&creds, 0, b"dir1", &SetAttributes::default())
             .await
             .unwrap();
         let (dir2_id, _) = fs
-            .process_mkdir(&creds, 0, b"dir2", &SetAttributes::default())
+            .mkdir(&creds, 0, b"dir2", &SetAttributes::default())
             .await
             .unwrap();
 
         let (file_id, _) = fs
-            .process_create(&creds, dir1_id, b"file.txt", &SetAttributes::default())
+            .create(&creds, dir1_id, b"file.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_write(
+        fs.write(
             &auth,
             file_id,
             0,
@@ -509,24 +498,21 @@ mod tests {
         .await
         .unwrap();
 
-        fs.process_rename(&auth, dir1_id, b"file.txt", dir2_id, b"file.txt")
+        fs.rename(&auth, dir1_id, b"file.txt", dir2_id, b"file.txt")
             .await
             .unwrap();
 
-        let result = fs.process_lookup(&creds, dir1_id, b"file.txt").await;
+        let result = fs.lookup(&creds, dir1_id, b"file.txt").await;
         assert!(result.is_err());
 
-        let found_id = fs
-            .process_lookup(&creds, dir2_id, b"file.txt")
-            .await
-            .unwrap();
+        let found_id = fs.lookup(&creds, dir2_id, b"file.txt").await.unwrap();
         assert_eq!(found_id, file_id);
 
-        let (data, _) = fs.process_read_file(&auth, found_id, 0, 100).await.unwrap();
+        let (data, _) = fs.read_file(&auth, found_id, 0, 100).await.unwrap();
         assert_eq!(data.as_ref(), b"test content");
 
-        let _dir1_inode = fs.load_inode(dir1_id).await.unwrap();
-        let _dir2_inode = fs.load_inode(dir2_id).await.unwrap();
+        let _dir1_inode = fs.inode_store.get(dir1_id).await.unwrap();
+        let _dir2_inode = fs.inode_store.get(dir2_id).await.unwrap();
     }
 
     #[tokio::test]
@@ -540,33 +526,30 @@ mod tests {
         };
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.bin", &SetAttributes::default())
+            .create(&creds, 0, b"test.bin", &SetAttributes::default())
             .await
             .unwrap();
 
         let chunk_size = 128 * 1024;
         let test_data: Vec<u8> = (0..chunk_size).map(|i| (i % 256) as u8).collect();
 
-        fs.process_write(&auth, file_id, 0, &bytes::Bytes::from(test_data.clone()))
+        fs.write(&auth, file_id, 0, &bytes::Bytes::from(test_data.clone()))
             .await
             .unwrap();
 
         let (data1, _) = fs
-            .process_read_file(&auth, file_id, 0, chunk_size as u32)
+            .read_file(&auth, file_id, 0, chunk_size as u32)
             .await
             .unwrap();
         assert_eq!(data1, test_data);
 
         let offset = chunk_size as u64 - 100;
-        let (data2, _) = fs
-            .process_read_file(&auth, file_id, offset, 200)
-            .await
-            .unwrap();
+        let (data2, _) = fs.read_file(&auth, file_id, offset, 200).await.unwrap();
         assert_eq!(data2.len(), 100);
         assert_eq!(&data2[..], &test_data[offset as usize..]);
 
         let (data3, eof) = fs
-            .process_read_file(&auth, file_id, chunk_size as u64, 100)
+            .read_file(&auth, file_id, chunk_size as u64, 100)
             .await
             .unwrap();
         assert_eq!(data3.len(), 0);
@@ -579,7 +562,7 @@ mod tests {
         let creds = test_creds();
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -590,7 +573,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let new_attr = fs.process_setattr(&creds, file_id, &setattr).await.unwrap();
+            let new_attr = fs.setattr(&creds, file_id, &setattr).await.unwrap();
             assert_eq!(new_attr.mode & 0o7777, *mode);
         }
     }
@@ -606,11 +589,11 @@ mod tests {
         };
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_write(
+        fs.write(
             &auth,
             file_id,
             0,
@@ -619,7 +602,7 @@ mod tests {
         .await
         .unwrap();
 
-        let initial_inode = fs.load_inode(file_id).await.unwrap();
+        let initial_inode = fs.inode_store.get(file_id).await.unwrap();
         let initial_attr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &initial_inode,
             id: file_id,
@@ -634,7 +617,7 @@ mod tests {
             ..Default::default()
         };
 
-        let new_attr = fs.process_setattr(&creds, file_id, &setattr).await.unwrap();
+        let new_attr = fs.setattr(&creds, file_id, &setattr).await.unwrap();
         assert!(
             new_attr.mtime >= initial_mtime,
             "mtime should be updated to server time"
@@ -655,10 +638,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (_, fattr) = fs
-            .process_create(&creds, 0, b"test.txt", &attr)
-            .await
-            .unwrap();
+        let (_, fattr) = fs.create(&creds, 0, b"test.txt", &attr).await.unwrap();
 
         assert_eq!(fattr.mode & 0o777, 0o640);
         assert_eq!(fattr.uid, 1001);
@@ -672,11 +652,11 @@ mod tests {
 
         let target = b"/nonexistent/path";
         let (link_id, _) = fs
-            .process_symlink(&creds, 0, b"broken_link", target, &SetAttributes::default())
+            .symlink(&creds, 0, b"broken_link", target, &SetAttributes::default())
             .await
             .unwrap();
 
-        let inode = fs.load_inode(link_id).await.unwrap();
+        let inode = fs.inode_store.get(link_id).await.unwrap();
         if let crate::fs::inode::Inode::Symlink(symlink) = inode {
             assert_eq!(&symlink.target, b"/nonexistent/path");
         } else {
@@ -695,15 +675,15 @@ mod tests {
         };
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"sparse.dat", &SetAttributes::default())
+            .create(&creds, 0, b"sparse.dat", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_write(&auth, file_id, 100, &bytes::Bytes::from(b"Hello".to_vec()))
+        fs.write(&auth, file_id, 100, &bytes::Bytes::from(b"Hello".to_vec()))
             .await
             .unwrap();
 
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         let attr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &inode,
             id: file_id,
@@ -711,11 +691,11 @@ mod tests {
         .into();
         assert_eq!(attr.size, 105);
 
-        let (data, _) = fs.process_read_file(&auth, file_id, 0, 100).await.unwrap();
+        let (data, _) = fs.read_file(&auth, file_id, 0, 100).await.unwrap();
         assert_eq!(data.len(), 100);
         assert!(data.iter().all(|&b| b == 0));
 
-        let (data, _) = fs.process_read_file(&auth, file_id, 100, 5).await.unwrap();
+        let (data, _) = fs.read_file(&auth, file_id, 100, 5).await.unwrap();
         assert_eq!(data.as_ref(), b"Hello");
     }
 
@@ -730,11 +710,11 @@ mod tests {
         };
 
         let (src_id, _) = fs
-            .process_create(&creds, 0, b"source.txt", &SetAttributes::default())
+            .create(&creds, 0, b"source.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_write(
+        fs.write(
             &auth,
             src_id,
             0,
@@ -744,11 +724,11 @@ mod tests {
         .unwrap();
 
         let (_target_id, _) = fs
-            .process_create(&creds, 0, b"target.txt", &SetAttributes::default())
+            .create(&creds, 0, b"target.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_write(
+        fs.write(
             &auth,
             _target_id,
             0,
@@ -757,17 +737,17 @@ mod tests {
         .await
         .unwrap();
 
-        fs.process_rename(&auth, 0, b"source.txt", 0, b"target.txt")
+        fs.rename(&auth, 0, b"source.txt", 0, b"target.txt")
             .await
             .unwrap();
 
-        let result = fs.process_lookup(&creds, 0, b"source.txt").await;
+        let result = fs.lookup(&creds, 0, b"source.txt").await;
         assert!(result.is_err());
 
-        let new_id = fs.process_lookup(&creds, 0, b"target.txt").await.unwrap();
+        let new_id = fs.lookup(&creds, 0, b"target.txt").await.unwrap();
         assert_eq!(new_id, src_id);
 
-        let (data, _) = fs.process_read_file(&auth, new_id, 0, 100).await.unwrap();
+        let (data, _) = fs.read_file(&auth, new_id, 0, 100).await.unwrap();
         assert_eq!(data.as_ref(), b"source content");
     }
 
@@ -777,7 +757,7 @@ mod tests {
         let creds = test_creds();
 
         let (dir_id, initial_attr) = fs
-            .process_mkdir(&creds, 0, b"testdir", &SetAttributes::default())
+            .mkdir(&creds, 0, b"testdir", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -788,7 +768,7 @@ mod tests {
             ..Default::default()
         };
 
-        let new_attr = fs.process_setattr(&creds, dir_id, &setattr).await.unwrap();
+        let new_attr = fs.setattr(&creds, dir_id, &setattr).await.unwrap();
         assert_eq!(new_attr.mode & 0o777, 0o700);
         assert_eq!(new_attr.uid, 1000);
         assert_eq!(new_attr.gid, 1000);
@@ -805,11 +785,11 @@ mod tests {
         };
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"growth.txt", &SetAttributes::default())
+            .create(&creds, 0, b"growth.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_write(
+        fs.write(
             &auth,
             file_id,
             0,
@@ -823,17 +803,17 @@ mod tests {
             ..Default::default()
         };
 
-        let attr_after = fs.process_setattr(&creds, file_id, &setattr).await.unwrap();
+        let attr_after = fs.setattr(&creds, file_id, &setattr).await.unwrap();
         assert_eq!(attr_after.size, 100);
 
-        let (data, _) = fs.process_read_file(&auth, file_id, 0, 13).await.unwrap();
+        let (data, _) = fs.read_file(&auth, file_id, 0, 13).await.unwrap();
         assert_eq!(data.as_ref(), b"Hello, World!");
 
-        let (data, _) = fs.process_read_file(&auth, file_id, 13, 87).await.unwrap();
+        let (data, _) = fs.read_file(&auth, file_id, 13, 87).await.unwrap();
         assert_eq!(data.len(), 87);
         assert!(data.iter().all(|&b| b == 0));
 
-        let (data, _) = fs.process_read_file(&auth, file_id, 0, 13).await.unwrap();
+        let (data, _) = fs.read_file(&auth, file_id, 0, 13).await.unwrap();
         assert_eq!(data.as_ref(), b"Hello, World!");
     }
 
@@ -848,15 +828,15 @@ mod tests {
         };
 
         let (a_id, _) = fs
-            .process_mkdir(&creds, 0, b"a", &SetAttributes::default())
+            .mkdir(&creds, 0, b"a", &SetAttributes::default())
             .await
             .unwrap();
         let (b_id, _) = fs
-            .process_mkdir(&creds, a_id, b"b", &SetAttributes::default())
+            .mkdir(&creds, a_id, b"b", &SetAttributes::default())
             .await
             .unwrap();
 
-        let result = fs.process_readdir(&auth, 0, 0, 10).await.unwrap();
+        let result = fs.readdir(&auth, 0, 0, 10).await.unwrap();
         let names: Vec<String> = result
             .entries
             .iter()
@@ -864,7 +844,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"a".to_string()));
 
-        let result = fs.process_readdir(&auth, a_id, 0, 10).await.unwrap();
+        let result = fs.readdir(&auth, a_id, 0, 10).await.unwrap();
         let names: Vec<String> = result
             .entries
             .iter()
@@ -872,7 +852,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"b".to_string()));
 
-        let result = fs.process_readdir(&auth, b_id, 0, 10).await.unwrap();
+        let result = fs.readdir(&auth, b_id, 0, 10).await.unwrap();
         let names: Vec<String> = result
             .entries
             .iter()
@@ -887,7 +867,7 @@ mod tests {
         let fs = create_test_fs().await;
         let creds = test_creds();
 
-        let parent_inode_before = fs.load_inode(0).await.unwrap();
+        let parent_inode_before = fs.inode_store.get(0).await.unwrap();
         let parent_attr_before: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &parent_inode_before,
             id: 0,
@@ -897,11 +877,11 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        fs.process_create(&creds, 0, b"newfile.txt", &SetAttributes::default())
+        fs.create(&creds, 0, b"newfile.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        let parent_inode_after = fs.load_inode(0).await.unwrap();
+        let parent_inode_after = fs.inode_store.get(0).await.unwrap();
         let parent_attr_after: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &parent_inode_after,
             id: 0,
@@ -915,11 +895,11 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         let (_dir_id, _) = fs
-            .process_mkdir(&creds, 0, b"testdir", &SetAttributes::default())
+            .mkdir(&creds, 0, b"testdir", &SetAttributes::default())
             .await
             .unwrap();
 
-        let parent_inode_final = fs.load_inode(0).await.unwrap();
+        let parent_inode_final = fs.inode_store.get(0).await.unwrap();
         let parent_attr_final: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &parent_inode_final,
             id: 0,
@@ -943,15 +923,15 @@ mod tests {
 
         // Create file 'a'
         let (file_a_id, _) = fs
-            .process_create(&creds, 0, b"a", &SetAttributes::default())
+            .create(&creds, 0, b"a", &SetAttributes::default())
             .await
             .unwrap();
 
         // Create hard link 'b' pointing to same inode as 'a'
-        fs.process_link(&auth, file_a_id, 0, b"b").await.unwrap();
+        fs.link(&auth, file_a_id, 0, b"b").await.unwrap();
 
         // Both 'a' and 'b' should be visible in directory listing
-        let entries = fs.process_readdir(&auth, 0, 0, 100).await.unwrap();
+        let entries = fs.readdir(&auth, 0, 0, 100).await.unwrap();
 
         let names: Vec<String> = entries
             .entries
@@ -970,12 +950,12 @@ mod tests {
         );
 
         // Verify they point to the same inode
-        let a_id = fs.process_lookup(&creds, 0, b"a").await.unwrap();
-        let b_id = fs.process_lookup(&creds, 0, b"b").await.unwrap();
+        let a_id = fs.lookup(&creds, 0, b"a").await.unwrap();
+        let b_id = fs.lookup(&creds, 0, b"b").await.unwrap();
         assert_eq!(a_id, b_id, "Both names should point to the same inode");
 
         // Check link count
-        let inode = fs.load_inode(a_id).await.unwrap();
+        let inode = fs.inode_store.get(a_id).await.unwrap();
         let fattr: crate::fs::types::FileAttributes = crate::fs::types::InodeWithId {
             inode: &inode,
             id: a_id,
@@ -990,7 +970,7 @@ mod tests {
         let creds = test_creds();
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"special.txt", &SetAttributes::default())
+            .create(&creds, 0, b"special.txt", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -1008,7 +988,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let new_attr = fs.process_setattr(&creds, file_id, &setattr).await.unwrap();
+            let new_attr = fs.setattr(&creds, file_id, &setattr).await.unwrap();
             assert_eq!(
                 new_attr.mode & 0o7777,
                 mode,
@@ -1023,19 +1003,19 @@ mod tests {
         let creds = test_creds();
 
         let (dir1_id, _) = fs
-            .process_mkdir(&creds, 0, b"dir1", &SetAttributes::default())
+            .mkdir(&creds, 0, b"dir1", &SetAttributes::default())
             .await
             .unwrap();
         let (dir2_id, _) = fs
-            .process_mkdir(&creds, dir1_id, b"dir2", &SetAttributes::default())
+            .mkdir(&creds, dir1_id, b"dir2", &SetAttributes::default())
             .await
             .unwrap();
         let (dir3_id, _) = fs
-            .process_mkdir(&creds, dir2_id, b"dir3", &SetAttributes::default())
+            .mkdir(&creds, dir2_id, b"dir3", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_create(&creds, dir3_id, b"file.txt", &SetAttributes::default())
+        fs.create(&creds, dir3_id, b"file.txt", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -1044,17 +1024,14 @@ mod tests {
             gid: 1000,
             gids: vec![1000],
         };
-        fs.process_rename(&auth, dir2_id, b"dir3", 0, b"moved_dir3")
+        fs.rename(&auth, dir2_id, b"dir3", 0, b"moved_dir3")
             .await
             .unwrap();
 
-        let found_id = fs.process_lookup(&creds, 0, b"moved_dir3").await.unwrap();
+        let found_id = fs.lookup(&creds, 0, b"moved_dir3").await.unwrap();
         assert_eq!(found_id, dir3_id);
 
-        let found_file = fs
-            .process_lookup(&creds, dir3_id, b"file.txt")
-            .await
-            .unwrap();
+        let found_file = fs.lookup(&creds, dir3_id, b"file.txt").await.unwrap();
         assert!(found_file > 0);
     }
 
@@ -1064,11 +1041,11 @@ mod tests {
         let creds = test_creds();
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"original.txt", &SetAttributes::default())
+            .create(&creds, 0, b"original.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, Some(0));
@@ -1077,7 +1054,7 @@ mod tests {
             _ => panic!("Expected file inode"),
         }
 
-        fs.process_link(
+        fs.link(
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
@@ -1091,7 +1068,7 @@ mod tests {
         .unwrap();
 
         // Parent should become None when file is hardlinked
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, None);
@@ -1107,11 +1084,11 @@ mod tests {
         let creds = test_creds();
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"original.txt", &SetAttributes::default())
+            .create(&creds, 0, b"original.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_link(
+        fs.link(
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
@@ -1124,7 +1101,7 @@ mod tests {
         .await
         .unwrap();
 
-        fs.process_remove(
+        fs.remove(
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
@@ -1137,7 +1114,7 @@ mod tests {
         .unwrap();
 
         // Parent should stay None even when nlink drops back to 1
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, None);
@@ -1153,11 +1130,11 @@ mod tests {
         let creds = test_creds();
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"original.txt", &SetAttributes::default())
+            .create(&creds, 0, b"original.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_link(
+        fs.link(
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
@@ -1170,7 +1147,7 @@ mod tests {
         .await
         .unwrap();
 
-        fs.process_remove(
+        fs.remove(
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
@@ -1183,11 +1160,11 @@ mod tests {
         .unwrap();
 
         let (dir_id, _) = fs
-            .process_mkdir(&creds, 0, b"subdir", &SetAttributes::default())
+            .mkdir(&creds, 0, b"subdir", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_rename(
+        fs.rename(
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
@@ -1202,7 +1179,7 @@ mod tests {
         .unwrap();
 
         // Parent should be lazily restored on rename when nlink=1
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, Some(dir_id));
@@ -1218,11 +1195,11 @@ mod tests {
         let creds = test_creds();
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"original.txt", &SetAttributes::default())
+            .create(&creds, 0, b"original.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_link(
+        fs.link(
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
@@ -1236,11 +1213,11 @@ mod tests {
         .unwrap();
 
         let (dir_id, _) = fs
-            .process_mkdir(&creds, 0, b"subdir", &SetAttributes::default())
+            .mkdir(&creds, 0, b"subdir", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_rename(
+        fs.rename(
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
@@ -1255,7 +1232,7 @@ mod tests {
         .unwrap();
 
         // Parent should stay None when renaming file with nlink > 1
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, None);
@@ -1276,7 +1253,7 @@ mod tests {
         };
 
         let (dir_id, _) = fs
-            .process_mkdir(
+            .mkdir(
                 &owner_creds,
                 0,
                 b"private_dir",
@@ -1289,11 +1266,11 @@ mod tests {
             .unwrap();
 
         let (file_id, _) = fs
-            .process_create(&owner_creds, dir_id, b"file.txt", &SetAttributes::default())
+            .create(&owner_creds, dir_id, b"file.txt", &SetAttributes::default())
             .await
             .unwrap();
 
-        fs.process_link(
+        fs.link(
             &AuthContext {
                 uid: 1000,
                 gid: 1000,
@@ -1306,7 +1283,7 @@ mod tests {
         .await
         .unwrap();
 
-        let inode = fs.load_inode(file_id).await.unwrap();
+        let inode = fs.inode_store.get(file_id).await.unwrap();
         match &inode {
             crate::fs::inode::Inode::File(f) => {
                 assert_eq!(f.parent, None);
@@ -1317,7 +1294,7 @@ mod tests {
 
         // Parent permission checks should be skipped when parent=None
         let result = fs
-            .process_read_file(
+            .read_file(
                 &AuthContext {
                     uid: 2000,
                     gid: 2000,
@@ -1360,27 +1337,27 @@ mod tests {
         };
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = bytes::Bytes::from(vec![0u8; 500_000]);
-        let result = fs.process_write(&auth, file_id, 0, &data).await;
+        let result = fs.write(&auth, file_id, 0, &data).await;
         assert!(result.is_ok());
 
         let data = bytes::Bytes::from(vec![0u8; 600_000]);
-        let result = fs.process_write(&auth, file_id, 500_000, &data).await;
+        let result = fs.write(&auth, file_id, 500_000, &data).await;
         assert!(matches!(result, Err(crate::fs::errors::FsError::NoSpace)));
 
-        fs.process_remove(&auth, 0, b"test.txt").await.unwrap();
+        fs.remove(&auth, 0, b"test.txt").await.unwrap();
 
         let (file_id2, _) = fs
-            .process_create(&creds, 0, b"test2.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test2.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = bytes::Bytes::from(vec![0u8; 500_000]);
-        let result = fs.process_write(&auth, file_id2, 0, &data).await;
+        let result = fs.write(&auth, file_id2, 0, &data).await;
         assert!(result.is_ok());
     }
 
@@ -1407,7 +1384,7 @@ mod tests {
         let creds = test_creds();
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
@@ -1415,21 +1392,21 @@ mod tests {
             size: SetSize::Set(500_000),
             ..Default::default()
         };
-        let result = fs.process_setattr(&creds, file_id, &setattr).await;
+        let result = fs.setattr(&creds, file_id, &setattr).await;
         assert!(result.is_ok());
 
         let setattr = SetAttributes {
             size: SetSize::Set(1_500_000),
             ..Default::default()
         };
-        let result = fs.process_setattr(&creds, file_id, &setattr).await;
+        let result = fs.setattr(&creds, file_id, &setattr).await;
         assert!(matches!(result, Err(crate::fs::errors::FsError::NoSpace)));
 
         let setattr = SetAttributes {
             size: SetSize::Set(100_000),
             ..Default::default()
         };
-        let result = fs.process_setattr(&creds, file_id, &setattr).await;
+        let result = fs.setattr(&creds, file_id, &setattr).await;
         assert!(result.is_ok());
     }
 
@@ -1461,27 +1438,27 @@ mod tests {
         };
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"big.txt", &SetAttributes::default())
+            .create(&creds, 0, b"big.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = bytes::Bytes::from(vec![0u8; 900_000]);
-        fs.process_write(&auth, file_id, 0, &data).await.unwrap();
+        fs.write(&auth, file_id, 0, &data).await.unwrap();
 
         let (file_id2, _) = fs
-            .process_create(&creds, 0, b"new.txt", &SetAttributes::default())
+            .create(&creds, 0, b"new.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = bytes::Bytes::from(vec![0u8; 200_000]);
-        let result = fs.process_write(&auth, file_id2, 0, &data).await;
+        let result = fs.write(&auth, file_id2, 0, &data).await;
         assert!(matches!(result, Err(crate::fs::errors::FsError::NoSpace)));
 
-        let result = fs.process_remove(&auth, 0, b"big.txt").await;
+        let result = fs.remove(&auth, 0, b"big.txt").await;
         assert!(result.is_ok());
 
         let data = bytes::Bytes::from(vec![0u8; 500_000]);
-        let result = fs.process_write(&auth, file_id2, 0, &data).await;
+        let result = fs.write(&auth, file_id2, 0, &data).await;
         assert!(result.is_ok());
     }
 
@@ -1496,12 +1473,12 @@ mod tests {
         };
 
         let (file_id, _) = fs
-            .process_create(&creds, 0, b"test.txt", &SetAttributes::default())
+            .create(&creds, 0, b"test.txt", &SetAttributes::default())
             .await
             .unwrap();
 
         let data = bytes::Bytes::from(vec![0u8; 10_000_000]);
-        let result = fs.process_write(&auth, file_id, 0, &data).await;
+        let result = fs.write(&auth, file_id, 0, &data).await;
         assert!(result.is_ok());
     }
 }

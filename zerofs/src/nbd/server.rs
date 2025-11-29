@@ -9,10 +9,11 @@ use super::protocol::{
     NBDInfoExport, NBDOptionHeader, NBDOptionReply, NBDRequest, NBDServerHandshake, NBDSimpleReply,
     TRANSMISSION_FLAGS,
 };
+use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
+use crate::fs::store::inode::EncodedFileId;
 use crate::fs::types::AuthContext;
-use crate::fs::{EncodedFileId, ZeroFS};
 use bytes::BytesMut;
 use deku::prelude::*;
 use std::net::SocketAddr;
@@ -158,7 +159,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         // Look up .nbd directory
         let nbd_dir_inode = self
             .filesystem
-            .lookup_by_name(0, b".nbd")
+            .directory_store
+            .get(0, b".nbd")
             .await
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
@@ -168,7 +170,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         let entries = self
             .filesystem
-            .process_readdir(&auth, nbd_dir_inode, 0, NBD_READDIR_DEFAULT_LIMIT)
+            .readdir(&auth, nbd_dir_inode, 0, NBD_READDIR_DEFAULT_LIMIT)
             .await
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
@@ -187,12 +189,17 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             let encoded_id = EncodedFileId::from(entry.fileid);
             let real_id = encoded_id.inode_id();
 
-            let inode = self.filesystem.load_inode(real_id).await.map_err(|e| {
-                NBDError::Io(std::io::Error::other(format!(
-                    "Failed to load inode for {}: {e:?}",
-                    String::from_utf8_lossy(name)
-                )))
-            })?;
+            let inode = self
+                .filesystem
+                .inode_store
+                .get(real_id)
+                .await
+                .map_err(|e| {
+                    NBDError::Io(std::io::Error::other(format!(
+                        "Failed to load inode for {}: {e:?}",
+                        String::from_utf8_lossy(name)
+                    )))
+                })?;
 
             if let Inode::File(file_inode) = inode {
                 devices.push(NBDDevice {
@@ -208,7 +215,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     async fn get_device_by_name(&self, name: &[u8]) -> Result<NBDDevice> {
         let nbd_dir_inode = self
             .filesystem
-            .lookup_by_name(0, b".nbd")
+            .directory_store
+            .get(0, b".nbd")
             .await
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
@@ -216,7 +224,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                 )))
             })?;
 
-        let device_inode = match self.filesystem.lookup_by_name(nbd_dir_inode, name).await {
+        let device_inode = match self
+            .filesystem
+            .directory_store
+            .get(nbd_dir_inode, name)
+            .await
+        {
             Ok(inode) => inode,
             Err(FsError::NotFound) => {
                 return Err(NBDError::DeviceNotFound(name.to_vec()));
@@ -230,7 +243,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         let inode = self
             .filesystem
-            .load_inode(device_inode)
+            .inode_store
+            .get(device_inode)
             .await
             .map_err(|e| {
                 NBDError::Io(std::io::Error::other(format!(
@@ -537,13 +551,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     async fn handle_transmission(&mut self, device: NBDDevice) -> Result<()> {
         let nbd_dir_inode = self
             .filesystem
-            .lookup_by_name(0, b".nbd")
+            .directory_store
+            .get(0, b".nbd")
             .await
             .map_err(|e| NBDError::Filesystem(format!("Failed to lookup .nbd directory: {e:?}")))?;
 
         let device_inode = self
             .filesystem
-            .lookup_by_name(nbd_dir_inode, &device.name)
+            .directory_store
+            .get(nbd_dir_inode, &device.name)
             .await
             .map_err(|e| NBDError::Filesystem(format!("Failed to lookup device file: {e:?}")))?;
 
@@ -662,7 +678,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         match self
             .filesystem
-            .process_read_file(&auth, inode, offset, length)
+            .read_file(&auth, inode, offset, length)
             .await
         {
             Ok((data, _)) => {
@@ -725,14 +741,10 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         }
 
         let data = data.freeze();
-        match self
-            .filesystem
-            .process_write(&auth, inode, offset, &data)
-            .await
-        {
+        match self.filesystem.write(&auth, inode, offset, &data).await {
             Ok(_) => {
                 if (flags & NBD_CMD_FLAG_FUA) != 0
-                    && let Err(e) = self.filesystem.flush().await
+                    && let Err(e) = self.filesystem.flush_coordinator.flush().await
                 {
                     error!("NBD write FUA flush failed: {:?}", e);
                     let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
@@ -756,7 +768,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     }
 
     async fn handle_flush(&mut self, cookie: u64) -> u32 {
-        match self.filesystem.flush().await {
+        match self.filesystem.flush_coordinator.flush().await {
             Ok(_) => {
                 if self
                     .send_simple_reply(cookie, NBD_SUCCESS, &[])
@@ -816,7 +828,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         {
             Ok(_) => {
                 if (flags & NBD_CMD_FLAG_FUA) != 0
-                    && let Err(e) = self.filesystem.flush().await
+                    && let Err(e) = self.filesystem.flush_coordinator.flush().await
                 {
                     error!("NBD trim FUA flush failed: {:?}", e);
                     let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
@@ -889,7 +901,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
             if self
                 .filesystem
-                .process_write(&auth, inode, current_offset, chunk_data)
+                .write(&auth, inode, current_offset, chunk_data)
                 .await
                 .is_err()
             {
@@ -904,7 +916,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         if write_succeeded {
             // Handle FUA flag - force unit access (flush after write_zeroes)
             if (flags & NBD_CMD_FLAG_FUA) != 0
-                && let Err(e) = self.filesystem.flush().await
+                && let Err(e) = self.filesystem.flush_coordinator.flush().await
             {
                 error!("NBD write_zeroes FUA flush failed: {:?}", e);
                 let _ = self.send_simple_reply(cookie, NBD_EIO, &[]).await;
