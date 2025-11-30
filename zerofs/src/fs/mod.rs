@@ -406,8 +406,7 @@ impl ZeroFS {
 
         let creds = Credentials::from_auth_context(auth);
 
-        // Optimistically load inode and check parent permissions before lock
-        let _ = self.get_inode_cached(id).await?;
+        // Check parent permissions before lock (also validates inode exists)
         self.check_parent_execute_permissions(id, &creds).await?;
 
         let _guard = self.lock_manager.acquire_write(id).await;
@@ -914,13 +913,12 @@ impl ZeroFS {
         }
     }
 
-    async fn readdir_internal(
+    pub async fn readdir(
         &self,
         auth: &AuthContext,
         dirid: InodeId,
         start_after: InodeId,
         max_entries: usize,
-        load_attrs: bool,
     ) -> Result<ReadDirResult, FsError> {
         debug!(
             "readdir: dirid={}, start_after={}, max_entries={}",
@@ -947,46 +945,37 @@ impl ZeroFS {
 
                 if !skip_special {
                     debug!("readdir: adding . entry for current directory");
-                    let dot_attr = if load_attrs {
+                    entries.push(DirEntry {
+                        fileid: dirid,
+                        name: b".".to_vec(),
+                        attr: InodeWithId {
+                            inode: &dir_inode,
+                            id: dirid,
+                        }
+                        .into(),
+                    });
+
+                    debug!("readdir: adding .. entry for parent directory");
+                    let parent_id = if dirid == 0 { 0 } else { dir.parent };
+                    let parent_attr = if parent_id == dirid {
                         InodeWithId {
                             inode: &dir_inode,
                             id: dirid,
                         }
                         .into()
                     } else {
-                        FileAttributes::default()
-                    };
-                    entries.push(DirEntry {
-                        fileid: dirid,
-                        name: b".".to_vec(),
-                        attr: dot_attr,
-                    });
-
-                    debug!("readdir: adding .. entry for parent directory");
-                    let parent_id = if dirid == 0 { 0 } else { dir.parent };
-                    let parent_attr = if load_attrs {
-                        if parent_id == dirid {
-                            InodeWithId {
+                        match self.get_inode_cached(parent_id).await {
+                            Ok(parent_inode) => InodeWithId {
+                                inode: &parent_inode,
+                                id: parent_id,
+                            }
+                            .into(),
+                            Err(_) => InodeWithId {
                                 inode: &dir_inode,
                                 id: dirid,
                             }
-                            .into()
-                        } else {
-                            match self.get_inode_cached(parent_id).await {
-                                Ok(parent_inode) => InodeWithId {
-                                    inode: &parent_inode,
-                                    id: parent_id,
-                                }
-                                .into(),
-                                Err(_) => InodeWithId {
-                                    inode: &dir_inode,
-                                    id: dirid,
-                                }
-                                .into(),
-                            }
+                            .into(),
                         }
-                    } else {
-                        FileAttributes::default()
                     };
                     entries.push(DirEntry {
                         fileid: parent_id,
@@ -1038,69 +1027,51 @@ impl ZeroFS {
                     dir_entries.push((inode_id, filename));
                 }
 
-                if load_attrs {
-                    const BUFFER_SIZE: usize = 256;
+                const BUFFER_SIZE: usize = 256;
 
-                    let inode_futures =
-                        stream::iter(dir_entries.into_iter()).map(|(inode_id, name)| async move {
-                            debug!("readdir: loading inode {} for entry '{}'", inode_id, String::from_utf8_lossy(&name));
-                            match self.get_inode_cached(inode_id).await {
-                                Ok(inode) => {
-                                    debug!("readdir: loaded inode {} successfully", inode_id);
-                                    Ok::<Option<(u64, Vec<u8>, Inode)>, FsError>(Some((inode_id, name, inode)))
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "readdir: skipping entry '{}' (inode {}) due to error: {:?}. Database may be corrupted.",
-                                        String::from_utf8_lossy(&name), inode_id, e
-                                    );
-                                    Ok(None)
-                                }
+                let inode_futures =
+                    stream::iter(dir_entries.into_iter()).map(|(inode_id, name)| async move {
+                        debug!("readdir: loading inode {} for entry '{}'", inode_id, String::from_utf8_lossy(&name));
+                        match self.get_inode_cached(inode_id).await {
+                            Ok(inode) => {
+                                debug!("readdir: loaded inode {} successfully", inode_id);
+                                Ok::<Option<(u64, Vec<u8>, Inode)>, FsError>(Some((inode_id, name, inode)))
                             }
-                        });
-
-                    let loaded_entries: Vec<_> = inode_futures
-                        .buffered(BUFFER_SIZE)
-                        .collect::<Vec<_>>()
-                        .await
-                        .into_iter()
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .flatten()
-                        .collect();
-
-                    for (inode_id, name, inode) in loaded_entries {
-                        let position = inode_positions.entry(inode_id).or_insert(0);
-                        let encoded_id = EncodedFileId::new(inode_id, *position)?.as_raw();
-                        *position += 1;
-
-                        entries.push(DirEntry {
-                            fileid: encoded_id,
-                            name,
-                            attr: InodeWithId {
-                                inode: &inode,
-                                id: inode_id,
+                            Err(e) => {
+                                tracing::error!(
+                                    "readdir: skipping entry '{}' (inode {}) due to error: {:?}. Database may be corrupted.",
+                                    String::from_utf8_lossy(&name), inode_id, e
+                                );
+                                Ok(None)
                             }
-                            .into(),
-                        });
-                        debug!("readdir: added entry with encoded id {}", encoded_id);
-                    }
-                } else {
-                    for (inode_id, name) in dir_entries {
-                        let position = inode_positions.entry(inode_id).or_insert(0);
-                        let encoded_id = EncodedFileId::new(inode_id, *position)?.as_raw();
-                        *position += 1;
+                        }
+                    });
 
-                        entries.push(DirEntry {
-                            fileid: encoded_id,
-                            name,
-                            attr: FileAttributes::default(),
-                        });
-                        debug!(
-                            "readdir: added entry with encoded id {} (no attrs)",
-                            encoded_id
-                        );
-                    }
+                let loaded_entries: Vec<_> = inode_futures
+                    .buffered(BUFFER_SIZE)
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+
+                for (inode_id, name, inode) in loaded_entries {
+                    let position = inode_positions.entry(inode_id).or_insert(0);
+                    let encoded_id = EncodedFileId::new(inode_id, *position)?.as_raw();
+                    *position += 1;
+
+                    entries.push(DirEntry {
+                        fileid: encoded_id,
+                        name,
+                        attr: InodeWithId {
+                            inode: &inode,
+                            id: inode_id,
+                        }
+                        .into(),
+                    });
+                    debug!("readdir: added entry with encoded id {}", encoded_id);
                 }
 
                 let end = !has_more;
@@ -1119,31 +1090,6 @@ impl ZeroFS {
             }
             _ => Err(FsError::NotDirectory),
         }
-    }
-
-    pub async fn readdir(
-        &self,
-        auth: &AuthContext,
-        dirid: InodeId,
-        start_after: InodeId,
-        max_entries: usize,
-    ) -> Result<ReadDirResult, FsError> {
-        self.readdir_internal(auth, dirid, start_after, max_entries, true)
-            .await
-    }
-
-    /// Public API: readdir without loading attributes (used by 9P)
-    /// Returns entries with default/empty attributes. Callers should load inodes separately
-    /// only for entries they actually need to return to the client.
-    pub async fn readdir_lite(
-        &self,
-        auth: &AuthContext,
-        dirid: InodeId,
-        start_after: InodeId,
-        max_entries: usize,
-    ) -> Result<ReadDirResult, FsError> {
-        self.readdir_internal(auth, dirid, start_after, max_entries, false)
-            .await
     }
 
     // === Operations from link_ops.rs ===
@@ -1894,7 +1840,7 @@ impl ZeroFS {
             .acquire_multiple_write(vec![dirid, file_id])
             .await;
 
-        let dir_inode = self.get_inode_cached(dirid).await?;
+        let mut dir_inode = self.get_inode_cached(dirid).await?;
         check_access(&dir_inode, &creds, AccessMode::Write)?;
         check_access(&dir_inode, &creds, AccessMode::Execute)?;
 
@@ -1920,8 +1866,6 @@ impl ZeroFS {
         };
 
         check_sticky_bit_delete(&dir_inode, &file_inode, &creds)?;
-
-        let mut dir_inode = self.get_inode_cached(dirid).await?;
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -2110,15 +2054,15 @@ impl ZeroFS {
             return Err(FsError::NotFound);
         }
 
-        let source_inode = self.get_inode_cached(source_inode_id).await?;
+        let mut source_inode = self.get_inode_cached(source_inode_id).await?;
         if matches!(source_inode, Inode::Directory(_))
             && self.is_ancestor_of(source_inode_id, to_dirid).await?
         {
             return Err(FsError::InvalidArgument);
         }
 
-        let from_dir = self.get_inode_cached(from_dirid).await?;
-        let to_dir = if from_dirid != to_dirid {
+        let mut from_dir = self.get_inode_cached(from_dirid).await?;
+        let mut to_dir = if from_dirid != to_dirid {
             Some(self.get_inode_cached(to_dirid).await?)
         } else {
             None
@@ -2148,9 +2092,9 @@ impl ZeroFS {
             }
         }
 
-        if let Some(target_id) = target_inode_id {
-            let target_inode = self.get_inode_cached(target_id).await?;
-            if let Inode::Directory(dir) = &target_inode
+        let target = if let Some(target_id) = target_inode_id {
+            let inode = self.get_inode_cached(target_id).await?;
+            if let Inode::Directory(dir) = &inode
                 && dir.entry_count > 0
             {
                 return Err(FsError::NotEmpty);
@@ -2161,16 +2105,17 @@ impl ZeroFS {
             } else {
                 &from_dir
             };
-            check_sticky_bit_delete(target_dir, &target_inode, &creds)?;
-        }
+            check_sticky_bit_delete(target_dir, &inode, &creds)?;
+            Some((target_id, inode))
+        } else {
+            None
+        };
 
         let mut txn = self.db.new_transaction()?;
 
         let mut target_was_directory = false;
         let mut target_stats_update = None;
-        if let Some(target_id) = target_inode_id {
-            let existing_inode = self.get_inode_cached(target_id).await?;
-
+        if let Some((target_id, existing_inode)) = target {
             target_was_directory = matches!(existing_inode, Inode::Directory(_));
 
             let (original_nlink, original_file_size, should_always_remove_stats) =
@@ -2268,8 +2213,7 @@ impl ZeroFS {
             .add(&mut txn, to_dirid, to_name, source_inode_id);
 
         if from_dirid != to_dirid {
-            let mut moved_inode = self.get_inode_cached(source_inode_id).await?;
-            match &mut moved_inode {
+            match &mut source_inode {
                 Inode::Directory(d) => d.parent = to_dirid,
                 Inode::File(f) => {
                     // Lazy restoration: if nlink == 1, restore parent
@@ -2294,30 +2238,35 @@ impl ZeroFS {
                 }
             }
             self.inode_store
-                .save(&mut txn, source_inode_id, &moved_inode)?;
+                .save(&mut txn, source_inode_id, &source_inode)?;
         }
 
         let (now_sec, now_nsec) = get_current_time();
 
         let is_moved_dir = matches!(source_inode, Inode::Directory(_));
 
-        let mut from_dir_inode = self.get_inode_cached(from_dirid).await?;
-        if let Inode::Directory(d) = &mut from_dir_inode {
-            d.entry_count = d.entry_count.saturating_sub(1);
-            if is_moved_dir && from_dirid != to_dirid {
-                d.nlink = d.nlink.saturating_sub(1);
+        // Update directory metadata using already-fetched inodes
+        if let Inode::Directory(d) = &mut from_dir {
+            if from_dirid != to_dirid {
+                // Moving to different directory: source leaves from_dir
+                d.entry_count = d.entry_count.saturating_sub(1);
+                if is_moved_dir {
+                    d.nlink = d.nlink.saturating_sub(1);
+                }
+            } else if target_inode_id.is_some() {
+                // Same directory with target: only target was removed (source renamed in place)
+                d.entry_count = d.entry_count.saturating_sub(1);
             }
+            // If same dir without target: entry_count unchanged (rename only)
             d.mtime = now_sec;
             d.mtime_nsec = now_nsec;
             d.ctime = now_sec;
             d.ctime_nsec = now_nsec;
         }
-        self.inode_store
-            .save(&mut txn, from_dirid, &from_dir_inode)?;
+        self.inode_store.save(&mut txn, from_dirid, &from_dir)?;
 
-        if from_dirid != to_dirid {
-            let mut to_dir_inode = self.get_inode_cached(to_dirid).await?;
-            if let Inode::Directory(d) = &mut to_dir_inode {
+        if let Some(ref mut to_dir) = to_dir {
+            if let Inode::Directory(d) = to_dir {
                 if target_inode_id.is_none() {
                     d.entry_count += 1;
                 }
@@ -2332,19 +2281,7 @@ impl ZeroFS {
                 d.ctime = now_sec;
                 d.ctime_nsec = now_nsec;
             }
-            self.inode_store.save(&mut txn, to_dirid, &to_dir_inode)?;
-        } else {
-            let mut dir_inode = self.get_inode_cached(from_dirid).await?;
-            if let Inode::Directory(d) = &mut dir_inode {
-                if target_inode_id.is_some() {
-                    d.entry_count = d.entry_count.saturating_sub(1);
-                }
-                d.mtime = now_sec;
-                d.mtime_nsec = now_nsec;
-                d.ctime = now_sec;
-                d.ctime_nsec = now_nsec;
-            }
-            self.inode_store.save(&mut txn, from_dirid, &dir_inode)?;
+            self.inode_store.save(&mut txn, to_dirid, to_dir)?;
         }
 
         if let Some(ref update) = target_stats_update {

@@ -12,11 +12,12 @@ use crate::fs::ZeroFS;
 use crate::fs::inode::{Inode, InodeId};
 use crate::fs::permissions::Credentials;
 use crate::fs::types::{
-    FileType, SetAttributes, SetGid, SetMode, SetSize, SetTime, SetUid, Timestamp,
+    FileAttributes, FileType, InodeWithId, SetAttributes, SetGid, SetMode, SetSize, SetTime,
+    SetUid, Timestamp,
 };
 
-pub const DEFAULT_MSIZE: u32 = 128 * 1024; // 1MB
-pub const DEFAULT_IOUNIT: u32 = 128 * 1024; // 1MB
+pub const DEFAULT_MSIZE: u32 = 256 * 1024;
+pub const DEFAULT_IOUNIT: u32 = 256 * 1024;
 
 pub const AT_REMOVEDIR: u32 = 0x200;
 // Linux dirent type constants
@@ -254,36 +255,24 @@ impl NinePHandler {
             let name_bytes = Bytes::copy_from_slice(&wname.data);
             current_path.push(name_bytes.clone());
 
-            let inode = match self.filesystem.get_inode_cached(current_id).await {
+            // lookup() already verifies current_id is a directory and returns ENOTDIR if not
+            let creds = src_fid.creds;
+            let child_id = match self
+                .filesystem
+                .lookup(&creds, current_id, &name_bytes)
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => return P9Message::error(tag, e.to_errno()),
+            };
+
+            let child_inode = match self.filesystem.get_inode_cached(child_id).await {
                 Ok(i) => i,
                 Err(e) => return P9Message::error(tag, e.to_errno()),
             };
 
-            match inode {
-                Inode::Directory(ref _dir) => {
-                    let creds = src_fid.creds;
-                    match self
-                        .filesystem
-                        .lookup(&creds, current_id, &name_bytes)
-                        .await
-                    {
-                        Ok(child_id) => {
-                            let child_inode = match self.filesystem.get_inode_cached(child_id).await
-                            {
-                                Ok(i) => i,
-                                Err(e) => {
-                                    return P9Message::error(tag, e.to_errno());
-                                }
-                            };
-
-                            wqids.push(inode_to_qid(&child_inode, child_id));
-                            current_id = child_id;
-                        }
-                        Err(e) => return P9Message::error(tag, e.to_errno()),
-                    }
-                }
-                _ => return P9Message::error(tag, libc::ENOTDIR as u32),
-            }
+            wqids.push(inode_to_qid(&child_inode, child_id));
+            current_id = child_id;
         }
 
         if tw.newfid != tw.fid || !tw.wnames.is_empty() {
@@ -373,60 +362,61 @@ impl NinePHandler {
 
         let is_sequential = tr.offset == fid_entry.dir_last_offset;
 
-        let mut entries_to_return: Vec<(u64, Vec<u8>, u64)> = Vec::new();
+        let mut entries_to_return: Vec<(u64, Vec<u8>, u64, FileAttributes)> = Vec::new();
 
-        let parent_id = match self.filesystem.get_inode_cached(fid_entry.inode_id).await {
-            Ok(Inode::Directory(dir)) => {
-                if fid_entry.inode_id == 0 {
-                    0
-                } else {
-                    dir.parent
+        let (dir_attrs, parent_id, parent_attrs) =
+            match self.filesystem.get_inode_cached(fid_entry.inode_id).await {
+                Ok(inode) => {
+                    let dir_attrs = FileAttributes::from(InodeWithId {
+                        inode: &inode,
+                        id: fid_entry.inode_id,
+                    });
+                    let parent_id = match &inode {
+                        Inode::Directory(dir) if fid_entry.inode_id != 0 => dir.parent,
+                        _ => 0,
+                    };
+                    let parent_attrs = if parent_id == fid_entry.inode_id {
+                        dir_attrs.clone()
+                    } else {
+                        match self.filesystem.get_inode_cached(parent_id).await {
+                            Ok(parent_inode) => FileAttributes::from(InodeWithId {
+                                inode: &parent_inode,
+                                id: parent_id,
+                            }),
+                            Err(_) => dir_attrs.clone(),
+                        }
+                    };
+                    (dir_attrs, parent_id, parent_attrs)
                 }
-            }
-            _ => 0,
-        };
+                Err(e) => return P9Message::error(tag, e.to_errno()),
+            };
 
-        // Handle special entries . and .. based on offset
         let mut current_offset: u64;
         let mut cookie: u64;
 
         if is_sequential && tr.offset >= 2 && fid_entry.dir_last_cookie != 0 {
-            // For sequential reads continuing from a previous position,
-            // use the saved offset and cookie
             current_offset = tr.offset;
             cookie = fid_entry.dir_last_cookie;
         } else {
-            // For non-sequential reads or starting fresh
             if tr.offset == 0 {
-                // Add both . and ..
-                entries_to_return.push((0, b".".to_vec(), fid_entry.inode_id));
-                entries_to_return.push((1, b"..".to_vec(), parent_id));
+                entries_to_return.push((0, b".".to_vec(), fid_entry.inode_id, dir_attrs.clone()));
+                entries_to_return.push((1, b"..".to_vec(), parent_id, parent_attrs));
                 current_offset = 2;
             } else if tr.offset == 1 {
-                // Add only ..
-                entries_to_return.push((1, b"..".to_vec(), parent_id));
+                entries_to_return.push((1, b"..".to_vec(), parent_id, parent_attrs));
                 current_offset = 2;
             } else {
-                // Start from offset 2 (after special entries)
                 current_offset = 2;
             }
-
-            // Set initial cookie
-            cookie = if tr.offset == 0 {
-                0
-            } else {
-                // Always start from 0 to get all entries, we'll filter special ones
-                0
-            };
+            cookie = 0;
         }
 
-        // Read regular entries - continue until we hit the end
         loop {
             const BATCH_SIZE: usize = P9_READDIR_BATCH_SIZE;
 
             match self
                 .filesystem
-                .readdir_lite(&(&auth).into(), fid_entry.inode_id, cookie, BATCH_SIZE)
+                .readdir(&(&auth).into(), fid_entry.inode_id, cookie, BATCH_SIZE)
                 .await
             {
                 Ok(result) => {
@@ -437,10 +427,7 @@ impl NinePHandler {
                     let was_end = result.end;
 
                     for entry in result.entries {
-                        let name = &entry.name;
-
-                        // Skip special entries - we handle them manually
-                        if name == b"." || name == b".." {
+                        if entry.name == b"." || entry.name == b".." {
                             cookie = entry.fileid;
                             continue;
                         }
@@ -448,33 +435,29 @@ impl NinePHandler {
                         if current_offset < tr.offset {
                             current_offset += 1;
                         } else {
-                            // We've reached the target offset, start collecting
-                            entries_to_return.push((current_offset, name.clone(), entry.fileid));
+                            entries_to_return.push((
+                                current_offset,
+                                entry.name.clone(),
+                                entry.fileid,
+                                entry.attr,
+                            ));
                             current_offset += 1;
                         }
 
                         cookie = entry.fileid;
                     }
 
-                    // If we've reached the end of the directory, we're done
                     if was_end {
                         break;
                     }
 
-                    // Continue fetching if:
-                    // 1. We haven't reached the requested offset yet (current_offset < tr.offset)
-                    // 2. OR we haven't collected any entries yet (entries_to_return.is_empty())
-                    // Only break if we have some entries to return
                     if !entries_to_return.is_empty() {
                         break;
                     }
-                    // Otherwise continue to the next batch
                 }
                 Err(e) => return P9Message::error(tag, e.to_errno()),
             }
         }
-
-        // Update FID state for next sequential read
 
         if let Some(mut fid) = self.session.fids.get_mut(&tr.fid) {
             fid.dir_last_offset = current_offset;
@@ -484,69 +467,14 @@ impl NinePHandler {
         let mut dir_entries = Vec::new();
         let mut total_size = 0usize;
 
-        for (offset, name, _) in &entries_to_return {
-            let (child_id, child_inode) = if name.as_slice() == b"." {
-                let inode = match self.filesystem.get_inode_cached(fid_entry.inode_id).await {
-                    Ok(i) => i,
-                    Err(_) => continue,
-                };
-                (fid_entry.inode_id, inode)
-            } else if name.as_slice() == b".." {
-                let current_inode = match self.filesystem.get_inode_cached(fid_entry.inode_id).await
-                {
-                    Ok(i) => i,
-                    Err(_) => continue,
-                };
-                let parent_id = match &current_inode {
-                    Inode::Directory(dir) => {
-                        if fid_entry.inode_id == 0 {
-                            0
-                        } else {
-                            dir.parent
-                        }
-                    }
-                    _ => unreachable!("readdir called on non-directory"),
-                };
-                let parent_inode = match self.filesystem.get_inode_cached(parent_id).await {
-                    Ok(i) => i,
-                    Err(_) => continue,
-                };
-                (parent_id, parent_inode)
-            } else {
-                let auth_ctx: crate::fs::types::AuthContext = (&auth).into();
-                let creds = Credentials::from_auth_context(&auth_ctx);
-                match self
-                    .filesystem
-                    .lookup(&creds, fid_entry.inode_id, name.as_slice())
-                    .await
-                {
-                    Ok(real_id) => {
-                        let inode = match self.filesystem.get_inode_cached(real_id).await {
-                            Ok(i) => i,
-                            Err(_) => continue,
-                        };
-                        (real_id, inode)
-                    }
-                    Err(_) => continue,
-                }
-            };
-
+        for (offset, name, fileid, attrs) in entries_to_return {
             let dirent = DirEntry {
-                qid: inode_to_qid(&child_inode, child_id),
+                qid: attrs_to_qid(&attrs, fileid),
                 offset: offset + 1,
-                type_: match child_inode {
-                    Inode::Directory(_) => DT_DIR,
-                    Inode::File(_) => DT_REG,
-                    Inode::Symlink(_) => DT_LNK,
-                    Inode::CharDevice(_) => DT_CHR,
-                    Inode::BlockDevice(_) => DT_BLK,
-                    Inode::Fifo(_) => DT_FIFO,
-                    Inode::Socket(_) => DT_SOCK,
-                },
-                name: P9String::new(name.to_vec()),
+                type_: filetype_to_dt(attrs.file_type),
+                name: P9String::new(name),
             };
 
-            // Check if adding this entry would exceed the count limit
             let entry_size = dirent.to_bytes().map(|b| b.len()).unwrap_or(0);
 
             if total_size + entry_size > tr.count as usize {
@@ -596,13 +524,8 @@ impl NinePHandler {
             )
             .await
         {
-            Ok((child_id, _post_attr)) => {
-                let child_inode = match self.filesystem.get_inode_cached(child_id).await {
-                    Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, e.to_errno()),
-                };
-
-                let qid = inode_to_qid(&child_inode, child_id);
+            Ok((child_id, post_attr)) => {
+                let qid = attrs_to_qid(&post_attr, child_id);
 
                 let mut fid_entry = match self.session.fids.get_mut(&tc.fid) {
                     Some(entry) => entry,
@@ -807,13 +730,8 @@ impl NinePHandler {
             )
             .await
         {
-            Ok((new_id, _post_attr)) => {
-                let new_inode = match self.filesystem.get_inode_cached(new_id).await {
-                    Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, e.to_errno()),
-                };
-
-                let qid = inode_to_qid(&new_inode, new_id);
+            Ok((new_id, post_attr)) => {
+                let qid = attrs_to_qid(&post_attr, new_id);
                 P9Message::new(tag, Message::Rmkdir(Rmkdir { qid }))
             }
             Err(e) => P9Message::error(tag, e.to_errno()),
@@ -848,13 +766,8 @@ impl NinePHandler {
             )
             .await
         {
-            Ok((new_id, _post_attr)) => {
-                let new_inode = match self.filesystem.get_inode_cached(new_id).await {
-                    Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, e.to_errno()),
-                };
-
-                let qid = inode_to_qid(&new_inode, new_id);
+            Ok((new_id, post_attr)) => {
+                let qid = attrs_to_qid(&post_attr, new_id);
                 P9Message::new(tag, Message::Rsymlink(Rsymlink { qid }))
             }
             Err(e) => P9Message::error(tag, e.to_errno()),
@@ -899,19 +812,12 @@ impl NinePHandler {
             )
             .await
         {
-            Ok((child_id, _post_attr)) => {
-                let child_inode = match self.filesystem.get_inode_cached(child_id).await {
-                    Ok(i) => i,
-                    Err(e) => return P9Message::error(tag, e.to_errno()),
-                };
-
-                P9Message::new(
-                    tag,
-                    Message::Rmknod(Rmknod {
-                        qid: inode_to_qid(&child_inode, child_id),
-                    }),
-                )
-            }
+            Ok((child_id, post_attr)) => P9Message::new(
+                tag,
+                Message::Rmknod(Rmknod {
+                    qid: attrs_to_qid(&post_attr, child_id),
+                }),
+            ),
             Err(e) => P9Message::error(tag, e.to_errno()),
         }
     }
@@ -1289,6 +1195,32 @@ pub fn inode_to_qid(inode: &Inode, inode_id: u64) -> Qid {
         type_,
         version: mtime_secs as u32,
         path: inode_id,
+    }
+}
+
+pub fn attrs_to_qid(attrs: &FileAttributes, fileid: u64) -> Qid {
+    let type_ = match attrs.file_type {
+        FileType::Directory => QID_TYPE_DIR,
+        FileType::Symlink => QID_TYPE_SYMLINK,
+        _ => QID_TYPE_FILE,
+    };
+
+    Qid {
+        type_,
+        version: attrs.mtime.seconds as u32,
+        path: fileid,
+    }
+}
+
+pub fn filetype_to_dt(ft: FileType) -> u8 {
+    match ft {
+        FileType::Directory => DT_DIR,
+        FileType::Regular => DT_REG,
+        FileType::Symlink => DT_LNK,
+        FileType::CharDevice => DT_CHR,
+        FileType::BlockDevice => DT_BLK,
+        FileType::Fifo => DT_FIFO,
+        FileType::Socket => DT_SOCK,
     }
 }
 
