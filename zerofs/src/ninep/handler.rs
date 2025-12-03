@@ -350,6 +350,11 @@ impl NinePHandler {
             return P9Message::error(tag, libc::EBADF as u32);
         }
 
+        // Clamp count to fit response within negotiated msize
+        let msize = self.session.msize.load(AtomicOrdering::Relaxed);
+        let max_count = msize.saturating_sub(P9_IOHDRSZ);
+        let count = tr.count.min(max_count);
+
         let auth = self.make_auth_context(&fid_entry.creds);
 
         // tr.offset is the cookie from the last entry the client received (0 for first call)
@@ -378,7 +383,7 @@ impl NinePHandler {
 
                     let entry_size = dirent.to_bytes().map(|b| b.len()).unwrap_or(0);
 
-                    if total_size + entry_size > tr.count as usize {
+                    if total_size + entry_size > count as usize {
                         break;
                     }
 
@@ -463,11 +468,16 @@ impl NinePHandler {
             return P9Message::error(tag, libc::EBADF as u32);
         }
 
+        // Clamp count to fit response within negotiated msize
+        let msize = self.session.msize.load(AtomicOrdering::Relaxed);
+        let max_count = msize.saturating_sub(P9_IOHDRSZ);
+        let count = tr.count.min(max_count);
+
         let auth = self.make_auth_context(&fid_entry.creds);
 
         match self
             .filesystem
-            .read_file(&(&auth).into(), fid_entry.inode_id, tr.offset, tr.count)
+            .read_file(&(&auth).into(), fid_entry.inode_id, tr.offset, count)
             .await
         {
             Ok((data, _eof)) => P9Message::new(
@@ -489,6 +499,17 @@ impl NinePHandler {
 
         if !fid_entry.opened {
             return P9Message::error(tag, libc::EBADF as u32);
+        }
+
+        let msize = self.session.msize.load(AtomicOrdering::Relaxed);
+        if (tw.data.len() as u64) + P9_IOHDRSZ as u64 > msize as u64 {
+            debug!(
+                "handle_write: rejecting write of {} bytes (exceeds msize {} - IOHDRSZ {})",
+                tw.data.len(),
+                msize,
+                P9_IOHDRSZ
+            );
+            return P9Message::error(tag, libc::EIO as u32);
         }
 
         debug!(

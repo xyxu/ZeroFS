@@ -2989,8 +2989,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16c3a10e8975744fddd018b3f442e6309f2a24713c4f1d65341ca0c472bc9c07"
+source = "git+https://github.com/slatedb/slatedb.git?rev=d490e5ba5504851347aabb138316a068e9c3c419#d490e5ba5504851347aabb138316a068e9c3c419"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4214,7 +4213,7 @@ dependencies = [
 
 [[package]]
 name = "zerofs"
-version = "0.19.1"
+version = "0.19.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4262,9 +4261,9 @@ dependencies = [
 
 [[package]]
 name = "zerofs_nfsserve"
-version = "0.17.1"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45d3372ac10bc2659da1e217875c37cae46714be5af4be92e61753e641851554"
+checksum = "2d77a28d248c17d7408a27137892f3b5c75f19f58d98ea16b158463409d5ed25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4276,6 +4275,7 @@ dependencies = [
  "num-traits",
  "smallvec",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-attributes",
 ]
