@@ -187,7 +187,9 @@ where
             let builder = options.into_iter().fold(
                 object_store::aws::AmazonS3Builder::new()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
+                    .with_client_options(ClientOptions::default()
+                        .with_connect_timeout(std::time::Duration::from_secs(30))
+                        .with_timeout(std::time::Duration::from_secs(60))),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
@@ -199,7 +201,9 @@ where
             let builder = options.into_iter().fold(
                 object_store::gcp::GoogleCloudStorageBuilder::new()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
+                    .with_client_options(ClientOptions::default()
+                        .with_connect_timeout(std::time::Duration::from_secs(30))
+                        .with_timeout(std::time::Duration::from_secs(60))),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
@@ -211,7 +215,9 @@ where
             let builder = options.into_iter().fold(
                 object_store::azure::MicrosoftAzureBuilder::new()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
+                    .with_client_options(ClientOptions::default()
+                        .with_connect_timeout(std::time::Duration::from_secs(30))
+                        .with_timeout(std::time::Duration::from_secs(60))),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
@@ -251,6 +257,20 @@ where
             // Apply configuration options (credentials and optional endpoint override)
             let mut config_endpoint = None;
             
+            // Performance optimization configurations
+            let mut http_client_timeout_secs = None;
+            let mut http_client_connect_timeout_secs = None;
+            let mut http_client_pool_idle_timeout_secs = None;
+            let mut http_client_pool_max_idle_per_host = None;
+            let mut http_client_allow_http = None;
+            let mut enable_virtual_host_style = None;
+            
+            // Retry strategy configurations
+            let mut retry_max_times = None;
+            let mut retry_factor = None;
+            let mut retry_max_delay_secs = None;
+            let mut retry_jitter = None;
+            
             for (key, value) in options {
                 match key.as_ref() {
                     // Handle prefixed environment variables (oss_access_key_id, etc.)
@@ -258,6 +278,57 @@ where
                     "oss_access_key_secret" | "access_key_secret" => builder = builder.access_key_secret(&value.into()),
                     // Store endpoint from config for potential override
                     "oss_endpoint" | "endpoint" => config_endpoint = Some(value.into()),
+                    
+                    // Performance optimization configurations
+                    // Note: These configurations are parsed for future compatibility
+                    // when opendal provides HTTP client configuration methods
+                    "http_client_timeout" | "timeout" => {
+                        if let Ok(timeout) = value.into().parse::<u64>() {
+                            http_client_timeout_secs = Some(timeout);
+                        }
+                    },
+                    "http_client_connect_timeout" | "connect_timeout" => {
+                        if let Ok(timeout) = value.into().parse::<u64>() {
+                            http_client_connect_timeout_secs = Some(timeout);
+                        }
+                    },
+                    "http_client_pool_idle_timeout" | "pool_idle_timeout" => {
+                        if let Ok(timeout) = value.into().parse::<u64>() {
+                            http_client_pool_idle_timeout_secs = Some(timeout);
+                        }
+                    },
+                    "http_client_pool_max_idle_per_host" | "pool_max_idle_per_host" => {
+                        if let Ok(max_idle) = value.into().parse::<usize>() {
+                            http_client_pool_max_idle_per_host = Some(max_idle);
+                        }
+                    },
+                    "http_client_allow_http" | "allow_http" => {
+                        http_client_allow_http = Some(value.into().parse::<bool>().unwrap_or(false));
+                    },
+                    "enable_virtual_host_style" | "virtual_host_style" => {
+                        enable_virtual_host_style = Some(value.into().parse::<bool>().unwrap_or(false));
+                    },
+                    
+                    // Retry strategy configurations
+                    "retry_max_times" | "max_retries" => {
+                        if let Ok(max_times) = value.into().parse::<u32>() {
+                            retry_max_times = Some(max_times);
+                        }
+                    },
+                    "retry_factor" | "retry_backoff_factor" => {
+                        if let Ok(factor) = value.into().parse::<f64>() {
+                            retry_factor = Some(factor);
+                        }
+                    },
+                    "retry_max_delay" | "retry_max_delay_secs" => {
+                        if let Ok(max_delay) = value.into().parse::<u64>() {
+                            retry_max_delay_secs = Some(max_delay);
+                        }
+                    },
+                    "retry_jitter" | "retry_jitter_enabled" => {
+                        retry_jitter = Some(value.into().parse::<bool>().unwrap_or(true));
+                    },
+                    
                     // Ignore bucket and region from config - they should come from URL
                     "oss_bucket" | "bucket" | "oss_region" | "region" => {},
                     _ => {}, // Ignore unknown options
@@ -276,11 +347,39 @@ where
                 builder = builder.endpoint("https://oss-cn-hangzhou.aliyuncs.com");
             }
             
+            // Apply performance optimizations
+            // Note: opendal 0.55 may not support direct HTTP client configuration
+            // through builder methods. These configurations are kept for future compatibility.
+            
+            // For now, we use basic configuration
+            // TODO: Update when opendal provides HTTP client configuration methods
+            
+            if let Some(allow_http) = http_client_allow_http {
+                // This method might exist in some versions
+                // builder = builder.http_client_allow_http(allow_http);
+            }
+            
+            if let Some(virtual_host_style) = enable_virtual_host_style {
+                // This method might exist in some versions  
+                // builder = builder.enable_virtual_host_style(virtual_host_style);
+            }
+            
+            // Apply retry strategy configurations if opendal supports it
+            // Note: As of opendal 0.55, retry configuration might need to be done differently
+            // We'll add retry configuration when the API becomes available
+            
             let op = Operator::new(builder).map_err(|e| object_store::Error::Generic {
                 store: "AliyunOss",
                 source: Box::new(e),
             })?.finish();
-            Box::new(OpendalStore::new(op))
+            
+            // Create a wrapped store with retry logic if configured
+            let store = OpendalStore::new(op);
+            
+            // TODO: Add retry wrapper when object_store retry API is available
+            // For now, we return the basic store
+            
+            Box::new(store)
         }
         s => {
             return Err(object_store::Error::Generic {

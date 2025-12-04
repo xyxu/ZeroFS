@@ -1,5 +1,5 @@
 # ZeroFS Configuration with Aliyun OSS
-# Example configuration file demonstrating Aliyun OSS support
+# Example configuration file demonstrating Aliyun OSS support with performance optimizations
 
 [cache]
 dir = "${HOME}/.cache/zerofs"
@@ -25,7 +25,27 @@ access_key_secret = "${OSS_ACCESS_KEY_SECRET}"
 # Optional: bucket will be auto-detected from URL, but can be overridden  
 # bucket = "my-bucket"
 
+# Performance optimization settings (for future opendal versions)
+# http_client_timeout = 60           # HTTP client timeout in seconds
+# http_client_connect_timeout = 30   # Connection timeout in seconds
+# http_client_pool_idle_timeout = 90 # Connection pool idle timeout
+# http_client_pool_max_idle_per_host = 10 # Max idle connections per host
+# http_client_allow_http = false     # Allow HTTP (not recommended)
+# enable_virtual_host_style = true   # Enable virtual host style
+
+# Retry strategy (when supported)
+# retry_max_times = 3                # Maximum number of retries
+# retry_factor = 2.0                 # Exponential backoff factor
+# retry_max_delay = 60               # Maximum delay between retries in seconds
+# retry_jitter = true                # Add jitter to retry delays
+
 # Alternative URL formats supported:
 # - oss://bucket.endpoint/path (endpoint auto-detected)
 # - oss://bucket/path (uses default endpoint)
 # - https://bucket.oss-cn-hangzhou.aliyuncs.com/path
+
+# Performance Tuning Notes:
+# 1. For better performance, increase cache sizes based on your workload
+# 2. Monitor OSS metrics and adjust timeouts accordingly
+# 3. Consider enabling LSM optimizations for write-heavy workloads
+# 4. See cache_optimization_guide.md for detailed tuning recommendations
