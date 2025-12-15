@@ -360,7 +360,10 @@ impl NFSFileSystem for NFSAdapter {
 
         let obj_attr = match self.getattr(auth, fileid).await {
             Ok(v) => post_op_attr::attributes(v),
-            Err(_) => post_op_attr::Void,
+            Err(e) => {
+                debug!("fsstat: getattr failed for fileid {}: {:?}", fileid, e);
+                post_op_attr::Void
+            }
         };
 
         let (used_bytes, used_inodes) = self.fs.global_stats.get_totals();
@@ -369,14 +372,17 @@ impl NFSFileSystem for NFSAdapter {
         let available_inodes = u64::MAX.saturating_sub(next_inode_id);
         let total_inodes = used_inodes + available_inodes;
 
-        // Use configured max_bytes from filesystem config
-        let total_bytes = self.fs.max_bytes;
+        // Use configured max_bytes from filesystem config, capped at 8 EiB
+        // to avoid breaking NFS clients that can't handle larger values
+        const MAX_NFS_BYTES: u64 = 8 * (1 << 60); // 8 EiB
+        let total_bytes = self.fs.max_bytes.min(MAX_NFS_BYTES);
+        let free_bytes = total_bytes.saturating_sub(used_bytes);
 
         let res = fsstat3 {
             obj_attributes: obj_attr,
             tbytes: total_bytes,
-            fbytes: total_bytes.saturating_sub(used_bytes),
-            abytes: total_bytes.saturating_sub(used_bytes),
+            fbytes: free_bytes,
+            abytes: free_bytes,
             tfiles: total_inodes,
             ffiles: available_inodes,
             afiles: available_inodes,

@@ -1,5 +1,6 @@
 use crate::fs::errors::FsError;
 use crate::fs::key_codec::KeyPrefix;
+use crate::task::spawn_blocking_named;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -29,6 +30,7 @@ pub fn exit_on_write_error(err: impl std::fmt::Display) -> ! {
     std::process::exit(1)
 }
 
+#[derive(Clone)]
 pub struct EncryptionManager {
     cipher: XChaCha20Poly1305,
 }
@@ -136,15 +138,19 @@ impl EncryptedTransaction {
             let operations = self.pending_operations;
             let encryptor = self.encryptor.clone();
 
-            let encrypted_operations: Result<Vec<_>, _> = operations
-                .into_iter()
-                .map(|(key, value)| {
-                    let encrypted = encryptor.encrypt(&key, &value)?;
-                    Ok::<(Bytes, Vec<u8>), anyhow::Error>((key, encrypted))
-                })
-                .collect();
+            let encrypted_operations = spawn_blocking_named("encrypt-batch", move || {
+                operations
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let encrypted = encryptor.encrypt(&key, &value)?;
+                        Ok::<(Bytes, Vec<u8>), anyhow::Error>((key, encrypted))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
 
-            for (key, encrypted) in encrypted_operations? {
+            for (key, encrypted) in encrypted_operations {
                 inner.put(&key, &encrypted);
             }
         }
@@ -216,6 +222,7 @@ impl EncryptedDb {
     pub async fn get_bytes(&self, key: &bytes::Bytes) -> Result<Option<bytes::Bytes>> {
         let read_options = ReadOptions {
             durability_filter: DurabilityLevel::Memory,
+            cache_blocks: true,
             ..Default::default()
         };
 
@@ -229,7 +236,12 @@ impl EncryptedDb {
 
         match encrypted {
             Some(encrypted) => {
-                let decrypted = self.encryptor.decrypt(key, &encrypted)?;
+                let encryptor = self.encryptor.clone();
+                let key = key.clone();
+                let decrypted =
+                    spawn_blocking_named("decrypt", move || encryptor.decrypt(&key, &encrypted))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
                 Ok(Some(bytes::Bytes::from(decrypted)))
             }
             None => Ok(None),
@@ -243,7 +255,8 @@ impl EncryptedDb {
         let encryptor = self.encryptor.clone();
         let scan_options = ScanOptions {
             durability_filter: DurabilityLevel::Memory,
-            read_ahead_bytes: 32 * 1024 * 1024,
+            read_ahead_bytes: 1024 * 1024,
+            cache_blocks: true,
             max_fetch_tasks: 8,
             ..Default::default()
         };
@@ -353,7 +366,14 @@ impl EncryptedDb {
             return Err(FsError::ReadOnlyFilesystem.into());
         }
 
-        let encrypted = self.encryptor.encrypt(key, value)?;
+        let encryptor = self.encryptor.clone();
+        let key_clone = key.clone();
+        let value = value.to_vec();
+        let encrypted =
+            spawn_blocking_named("encrypt", move || encryptor.encrypt(&key_clone, &value))
+                .await
+                .map_err(|e| anyhow::anyhow!("Task join error: {}", e))??;
+
         match &self.inner {
             SlateDbHandle::ReadWrite(db) => {
                 if let Err(e) = db

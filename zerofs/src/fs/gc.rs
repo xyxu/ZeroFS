@@ -3,6 +3,7 @@ use crate::fs::CHUNK_SIZE;
 use crate::fs::errors::FsError;
 use crate::fs::metrics::FileSystemStats;
 use crate::fs::store::{ChunkStore, TombstoneStore};
+use crate::task::{spawn_named, spawn_named_on};
 use bytes::Bytes;
 use slatedb::config::WriteOptions;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 const MAX_CHUNKS_PER_ROUND: usize = 10_000;
+const MAX_TOMBSTONES_PER_ROUND: usize = 10_000;
 
 pub struct GarbageCollector {
     db: Arc<EncryptedDb>,
@@ -35,8 +37,12 @@ impl GarbageCollector {
         }
     }
 
-    pub fn start(self: Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    pub fn start(
+        self: Arc<Self>,
+        shutdown: CancellationToken,
+        runtime: Option<tokio::runtime::Handle>,
+    ) -> JoinHandle<()> {
+        let fut = async move {
             info!("Starting garbage collection task (runs continuously)");
             loop {
                 tokio::select! {
@@ -59,7 +65,13 @@ impl GarbageCollector {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
                 }
             }
-        })
+        };
+
+        if let Some(rt) = runtime {
+            spawn_named_on("gc", fut, &rt)
+        } else {
+            spawn_named("gc", fut)
+        }
     }
 
     pub async fn run(&self) -> Result<(), FsError> {
@@ -69,6 +81,7 @@ impl GarbageCollector {
             let mut tombstones_to_update: Vec<(Bytes, u64, usize, bool)> = Vec::new();
             let mut chunks_deleted_this_round = 0;
             let mut tombstones_completed_this_round = 0;
+            let mut tombstones_processed_this_round = 0;
             let mut found_incomplete_tombstones = false;
 
             let iter = self.tombstone_store.list().await?;
@@ -77,16 +90,26 @@ impl GarbageCollector {
             let mut chunks_remaining_in_round = MAX_CHUNKS_PER_ROUND;
 
             while let Some(result) = futures::StreamExt::next(&mut iter).await {
-                if chunks_remaining_in_round == 0 {
+                let entry = result?;
+                tombstones_processed_this_round += 1;
+
+                if tombstones_processed_this_round % 100 == 0 {
+                    tokio::task::yield_now().await;
+                }
+
+                if tombstones_processed_this_round >= MAX_TOMBSTONES_PER_ROUND {
                     found_incomplete_tombstones = true;
                     break;
                 }
 
-                let entry = result?;
-
                 if entry.remaining_size == 0 {
                     tombstones_to_update.push((entry.key, 0, 0, true));
                     continue;
+                }
+
+                if chunks_remaining_in_round == 0 {
+                    found_incomplete_tombstones = true;
+                    break;
                 }
 
                 let total_chunks = entry.remaining_size.div_ceil(CHUNK_SIZE as u64) as usize;

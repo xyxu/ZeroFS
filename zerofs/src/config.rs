@@ -52,16 +52,11 @@ pub struct FilesystemConfig {
 }
 
 impl FilesystemConfig {
-    /// Default maximum bytes: 8 EiB
-    pub const DEFAULT_MAX_BYTES: u64 = 8 << 60;
-
     pub fn max_bytes(&self) -> u64 {
         self.max_size_gb
-            .and_then(|gb| {
-                let gb_int = gb as u64;
-                gb_int.checked_mul(1_000_000_000)
-            })
-            .unwrap_or(Self::DEFAULT_MAX_BYTES)
+            .filter(|&gb| gb.is_finite() && gb > 0.0)
+            .map(|gb| (gb * 1_000_000_000.0) as u64)
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -335,12 +330,20 @@ where
 }
 
 impl Settings {
-    pub fn from_file(config_path: &str) -> Result<Self> {
-        let content = fs::read_to_string(config_path)
-            .with_context(|| format!("Failed to read config file: {}", config_path))?;
+    pub fn max_bytes(&self) -> u64 {
+        self.filesystem
+            .as_ref()
+            .map(|fs| fs.max_bytes())
+            .unwrap_or(u64::MAX)
+    }
+
+    pub fn from_file(config_path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = config_path.as_ref();
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
         let settings: Settings = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", config_path))?;
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
         Ok(settings)
     }
@@ -417,7 +420,7 @@ impl Settings {
         }
     }
 
-    pub fn write_default_config(path: &str) -> Result<()> {
+    pub fn write_default_config(path: impl AsRef<std::path::Path>) -> Result<()> {
         let default = Self::generate_default();
         let mut toml_string = toml::to_string_pretty(&default)?;
 
@@ -431,7 +434,7 @@ impl Settings {
         toml_string.push_str("\n# Optional filesystem quota configuration\n");
         toml_string
             .push_str("# Limit the maximum size of the filesystem to prevent unlimited growth\n");
-        toml_string.push_str("# If not specified, defaults to 8 EiB (effectively unlimited)\n");
+        toml_string.push_str("# If not specified, defaults to 16 EiB (effectively unlimited)\n");
         toml_string.push_str("\n# [filesystem]\n");
         toml_string.push_str("# max_size_gb = 100.0  # Limit filesystem to 100 GB\n");
 

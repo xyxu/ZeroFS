@@ -12,6 +12,8 @@ pub mod tracing;
 pub mod types;
 pub mod write_coordinator;
 
+use std::path::PathBuf;
+
 use self::flush_coordinator::FlushCoordinator;
 use self::key_codec::KeyCodec;
 use self::lock_manager::LockManager;
@@ -28,7 +30,9 @@ pub use self::gc::GarbageCollector;
 pub use self::write_coordinator::SequenceGuard;
 
 use self::errors::FsError;
-use self::inode::{DirectoryInode, FileInode, Inode, InodeId, SpecialInode, SymlinkInode};
+use self::inode::{
+    DirectoryInode, FileInode, Inode, InodeAttrs, InodeId, SpecialInode, SymlinkInode,
+};
 use self::permissions::{
     AccessMode, Credentials, can_set_times, check_access, check_ownership, check_sticky_bit_delete,
     validate_mode,
@@ -38,7 +42,7 @@ use self::types::{
     AuthContext, DirEntry, FileAttributes, FileType, InodeWithId, ReadDirResult, SetAttributes,
     SetGid, SetMode, SetSize, SetTime, SetUid,
 };
-use ::tracing::{debug, error};
+use ::tracing::{debug, error, warn};
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::stream::{self, StreamExt};
@@ -50,9 +54,13 @@ fn get_current_uid_gid() -> (u32, u32) {
 }
 
 pub fn get_current_time() -> (u64, u32) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("System time is before UNIX epoch: {:?}", e);
+            std::time::Duration::ZERO
+        }
+    };
     (now.as_secs(), now.subsec_nanos())
 }
 
@@ -86,7 +94,7 @@ pub struct ZeroFS {
 
 #[derive(Clone)]
 pub struct CacheConfig {
-    pub root_folder: String,
+    pub root_folder: PathBuf,
     pub max_cache_size_gb: f64,
     pub memory_cache_size_gb: Option<f64>,
 }
@@ -302,7 +310,7 @@ impl ZeroFS {
         Self::new_with_slatedb(
             crate::encryption::SlateDbHandle::ReadWrite(slatedb),
             encryption_key,
-            crate::config::FilesystemConfig::DEFAULT_MAX_BYTES,
+            u64::MAX,
         )
         .await
     }
@@ -325,7 +333,7 @@ impl ZeroFS {
         Self::new_with_slatedb(
             crate::encryption::SlateDbHandle::ReadOnly(ArcSwap::new(reader)),
             encryption_key,
-            crate::config::FilesystemConfig::DEFAULT_MAX_BYTES,
+            u64::MAX,
         )
         .await
     }
@@ -343,15 +351,7 @@ impl ZeroFS {
 
         while current_id != 0 {
             let inode = self.inode_store.get(current_id).await?;
-            let parent_id = match inode {
-                Inode::Directory(d) => Some(d.parent),
-                Inode::File(f) => f.parent,
-                Inode::Symlink(s) => s.parent,
-                Inode::Fifo(s) => s.parent,
-                Inode::Socket(s) => s.parent,
-                Inode::CharDevice(s) => s.parent,
-                Inode::BlockDevice(s) => s.parent,
-            };
+            let parent_id = inode.parent();
 
             // If parent is None (file is hardlinked), can't determine ancestry
             let Some(pid) = parent_id else {
@@ -386,15 +386,7 @@ impl ZeroFS {
         }
 
         let inode = self.inode_store.get(id).await?;
-        let parent_id = match &inode {
-            Inode::Directory(d) => Some(d.parent),
-            Inode::File(f) => f.parent,
-            Inode::Symlink(s) => s.parent,
-            Inode::Fifo(s) => s.parent,
-            Inode::Socket(s) => s.parent,
-            Inode::CharDevice(s) => s.parent,
-            Inode::BlockDevice(s) => s.parent,
-        };
+        let parent_id = inode.parent();
 
         // If parent is None (file is hardlinked), skip parent permission checks
         let Some(mut current_id) = parent_id else {
@@ -480,7 +472,15 @@ impl ZeroFS {
                     file.mode &= !0o6000;
                 }
 
+                let parent_name_for_update = file.parent.zip(file.name.clone());
+
                 self.inode_store.save(&mut txn, id, &inode)?;
+
+                if let Some((parent_id, name)) = parent_name_for_update {
+                    self.directory_store
+                        .update_inode_in_entry(&mut txn, parent_id, &name, id, &inode)
+                        .await?;
+                }
 
                 let stats_update = if let Some(update) = self
                     .global_stats
@@ -599,10 +599,16 @@ impl ZeroFS {
                     .allocate_cookie(dirid, &mut txn)
                     .await?;
 
-                self.inode_store
-                    .save(&mut txn, file_id, &Inode::File(file_inode.clone()))?;
-                self.directory_store
-                    .add(&mut txn, dirid, name, file_id, cookie);
+                let file_inode_enum = Inode::File(file_inode.clone());
+                self.inode_store.save(&mut txn, file_id, &file_inode_enum)?;
+                self.directory_store.add(
+                    &mut txn,
+                    dirid,
+                    name,
+                    file_id,
+                    cookie,
+                    Some(&file_inode_enum),
+                );
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -916,13 +922,17 @@ impl ZeroFS {
                     .allocate_cookie(dirid, &mut txn)
                     .await?;
 
-                self.inode_store.save(
+                let new_dir_inode_enum = Inode::Directory(new_dir_inode.clone());
+                self.inode_store
+                    .save(&mut txn, new_dir_id, &new_dir_inode_enum)?;
+                self.directory_store.add(
                     &mut txn,
+                    dirid,
+                    name,
                     new_dir_id,
-                    &Inode::Directory(new_dir_inode.clone()),
-                )?;
-                self.directory_store
-                    .add(&mut txn, dirid, name, new_dir_id, cookie);
+                    cookie,
+                    Some(&new_dir_inode_enum),
+                );
 
                 dir.entry_count += 1;
                 if dir.nlink == u32::MAX {
@@ -1012,18 +1022,12 @@ impl ZeroFS {
                         }
                         .into()
                     } else {
-                        match self.inode_store.get(parent_id).await {
-                            Ok(parent_inode) => InodeWithId {
-                                inode: &parent_inode,
-                                id: parent_id,
-                            }
-                            .into(),
-                            Err(_) => InodeWithId {
-                                inode: &dir_inode,
-                                id: dirid,
-                            }
-                            .into(),
+                        let parent_inode = self.inode_store.get(parent_id).await?;
+                        InodeWithId {
+                            inode: &parent_inode,
+                            id: parent_id,
                         }
+                        .into()
                     };
                     entries.push(DirEntry {
                         fileid: parent_id,
@@ -1041,7 +1045,7 @@ impl ZeroFS {
                 };
                 pin_mut!(iter);
 
-                let mut dir_entries = Vec::new();
+                let mut dir_entries: Vec<(InodeId, Vec<u8>, u64, Option<Inode>)> = Vec::new();
                 let mut has_more = false;
 
                 while let Some(result) = iter.next().await {
@@ -1050,47 +1054,65 @@ impl ZeroFS {
                         break;
                     }
                     let entry = result?;
-                    dir_entries.push((entry.inode_id, entry.name, entry.cookie));
+                    dir_entries.push((entry.inode_id, entry.name, entry.cookie, entry.inode));
                 }
 
-                const BUFFER_SIZE: usize = 256;
-
-                let inode_futures = stream::iter(dir_entries.into_iter()).map(
-                    |(inode_id, name, cookie)| async move {
-                        match self.inode_store.get(inode_id).await {
-                            Ok(inode) => Ok::<_, FsError>(Some((inode_id, name, inode, cookie))),
-                            Err(e) => {
-                                error!(
-                                    "readdir: skipping entry (inode {}) due to error: {:?}",
-                                    inode_id, e
-                                );
-                                Ok(None)
-                            }
-                        }
-                    },
-                );
-
-                let loaded_entries: Vec<_> = inode_futures
-                    .buffered(BUFFER_SIZE)
-                    .collect::<Vec<_>>()
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .flatten()
+                let lookup_indices: Vec<usize> = dir_entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, _, _, inode))| inode.is_none())
+                    .map(|(i, _)| i)
                     .collect();
 
-                for (inode_id, name, inode, cookie) in loaded_entries {
-                    entries.push(DirEntry {
-                        fileid: inode_id,
-                        name,
-                        attr: InodeWithId {
-                            inode: &inode,
-                            id: inode_id,
-                        }
-                        .into(),
-                        cookie,
-                    });
+                if !lookup_indices.is_empty() {
+                    const BUFFER_SIZE: usize = 256;
+
+                    let lookup_entries: Vec<_> = lookup_indices
+                        .iter()
+                        .map(|&i| (i, dir_entries[i].0))
+                        .collect();
+
+                    let inode_futures = stream::iter(lookup_entries.into_iter()).map(
+                        |(idx, inode_id)| async move {
+                            match self.inode_store.get(inode_id).await {
+                                Ok(inode) => Ok::<_, FsError>((idx, Some(inode))),
+                                Err(FsError::NotFound) => {
+                                    debug!("readdir: skipping deleted entry (inode {})", inode_id);
+                                    Ok((idx, None))
+                                }
+                                Err(e) => {
+                                    error!("readdir: failed to load inode {}: {:?}", inode_id, e);
+                                    Err(e)
+                                }
+                            }
+                        },
+                    );
+
+                    let loaded_inodes: Vec<_> = inode_futures
+                        .buffered(BUFFER_SIZE)
+                        .collect::<Vec<_>>()
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    for (idx, inode_opt) in loaded_inodes {
+                        dir_entries[idx].3 = inode_opt;
+                    }
+                }
+
+                for (inode_id, name, cookie, inode_opt) in dir_entries {
+                    if let Some(inode) = inode_opt {
+                        entries.push(DirEntry {
+                            fileid: inode_id,
+                            name,
+                            attr: InodeWithId {
+                                inode: &inode,
+                                id: inode_id,
+                            }
+                            .into(),
+                            cookie,
+                        });
+                    }
                 }
 
                 self.stats.read_operations.fetch_add(1, Ordering::Relaxed);
@@ -1136,11 +1158,6 @@ impl ZeroFS {
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
-
-        let (_default_uid, _default_gid) = match &dir_inode {
-            Inode::Directory(d) => (d.uid, d.gid),
-            _ => (65534, 65534),
-        };
 
         let dir = match &mut dir_inode {
             Inode::Directory(d) => d,
@@ -1192,8 +1209,14 @@ impl ZeroFS {
             .await?;
 
         self.inode_store.save(&mut txn, new_id, &symlink_inode)?;
-        self.directory_store
-            .add(&mut txn, dirid, linkname, new_id, cookie);
+        self.directory_store.add(
+            &mut txn,
+            dirid,
+            linkname,
+            new_id,
+            cookie,
+            Some(&symlink_inode),
+        );
 
         dir.entry_count += 1;
         dir.mtime = now_sec;
@@ -1282,13 +1305,24 @@ impl ZeroFS {
             return Err(FsError::Exists);
         }
 
+        let original_parent_name = file_inode
+            .parent()
+            .zip(file_inode.name().map(|n| n.to_vec()));
+
         let mut txn = self.db.new_transaction()?;
         let cookie = self
             .directory_store
             .allocate_cookie(linkdirid, &mut txn)
             .await?;
+
         self.directory_store
-            .add(&mut txn, linkdirid, linkname, fileid, cookie);
+            .add(&mut txn, linkdirid, linkname, fileid, cookie, None);
+
+        if let Some((orig_parent, orig_name)) = original_parent_name {
+            self.directory_store
+                .convert_to_reference(&mut txn, orig_parent, &orig_name, fileid)
+                .await?;
+        }
 
         let (now_sec, now_nsec) = get_current_time();
         match &mut file_inode {
@@ -1297,7 +1331,6 @@ impl ZeroFS {
                     return Err(FsError::TooManyLinks);
                 }
                 file.nlink += 1;
-                // When transitioning from 1 to 2+ links, clear parent/name for hardlinked files
                 if file.nlink > 1 {
                     file.parent = None;
                     file.name = None;
@@ -1313,7 +1346,6 @@ impl ZeroFS {
                     return Err(FsError::TooManyLinks);
                 }
                 special.nlink += 1;
-                // When transitioning from 1 to 2+ links, clear parent/name for hardlinked files
                 if special.nlink > 1 {
                     special.parent = None;
                     special.name = None;
@@ -1449,7 +1481,15 @@ impl ZeroFS {
                             .truncate(&mut txn, id, old_size, new_size)
                             .await?;
 
+                        let parent_name_for_update = file.parent.zip(file.name.clone());
+
                         self.inode_store.save(&mut txn, id, &inode)?;
+
+                        if let Some((parent_id, name)) = parent_name_for_update {
+                            self.directory_store
+                                .update_inode_in_entry(&mut txn, parent_id, &name, id, &inode)
+                                .await?;
+                        }
 
                         let stats_update = if let Some(update) = self
                             .global_stats
@@ -1748,6 +1788,15 @@ impl ZeroFS {
 
         let mut txn = self.db.new_transaction()?;
         self.inode_store.save(&mut txn, id, &inode)?;
+
+        if let Some(parent_id) = inode.parent()
+            && let Some(name) = inode.name()
+        {
+            self.directory_store
+                .update_inode_in_entry(&mut txn, parent_id, name, id, &inode)
+                .await?;
+        }
+
         let mut seq_guard = self.write_coordinator.allocate_sequence();
         self.commit_transaction(txn, &mut seq_guard).await?;
 
@@ -1789,14 +1838,6 @@ impl ZeroFS {
 
         check_access(&dir_inode, creds, AccessMode::Write)?;
         check_access(&dir_inode, creds, AccessMode::Execute)?;
-
-        let (_default_uid, _default_gid, _parent_mode) = match &dir_inode {
-            Inode::Directory(d) => (d.uid, d.gid, d.mode),
-            _ => {
-                debug!("Parent is not a directory");
-                return Err(FsError::NotDirectory);
-            }
-        };
 
         match &mut dir_inode {
             Inode::Directory(dir) => {
@@ -1859,7 +1900,7 @@ impl ZeroFS {
 
                 self.inode_store.save(&mut txn, special_id, &inode)?;
                 self.directory_store
-                    .add(&mut txn, dirid, name, special_id, cookie);
+                    .add(&mut txn, dirid, name, special_id, cookie, Some(&inode));
 
                 dir.entry_count += 1;
                 dir.mtime = now_sec;
@@ -2329,8 +2370,6 @@ impl ZeroFS {
             self.directory_store
                 .unlink_entry(&mut txn, to_dirid, to_name, target_cookie.unwrap());
         } else if same_inode {
-            // When source and target are the same inode, we still need to unlink the target entry
-            // but we skip the inode processing above since we handle nlink when saving source_inode
             self.directory_store
                 .unlink_entry(&mut txn, to_dirid, to_name, target_cookie.unwrap());
         }
@@ -2338,22 +2377,6 @@ impl ZeroFS {
         self.directory_store
             .unlink_entry(&mut txn, from_dirid, from_name, source_cookie);
 
-        // Reuse cookie when renaming within the same directory to avoid
-        // duplicate entries during readdir iteration
-        let new_cookie = if from_dirid == to_dirid {
-            source_cookie
-        } else {
-            self.directory_store
-                .allocate_cookie(to_dirid, &mut txn)
-                .await?
-        };
-
-        self.directory_store
-            .add(&mut txn, to_dirid, to_name, source_inode_id, new_cookie);
-
-        // Update source inode's name (and parent if directory changed)
-        // For hardlinked files (nlink > 1), parent/name are already None
-        // When same_inode is true, we need to decrement nlink since we're removing the target entry
         let dir_changed = from_dirid != to_dirid;
         let (now_sec, now_nsec) = get_current_time();
         match &mut source_inode {
@@ -2364,8 +2387,6 @@ impl ZeroFS {
                 d.name = Some(to_name.to_vec());
             }
             Inode::File(f) => {
-                // When renaming one hardlink over another to the same inode,
-                // decrement nlink since we're removing the target entry
                 if same_inode {
                     f.nlink = f.nlink.saturating_sub(1);
                     f.ctime = now_sec;
@@ -2396,12 +2417,34 @@ impl ZeroFS {
                 }
             }
         }
+
+        let new_cookie = if from_dirid == to_dirid {
+            source_cookie
+        } else {
+            self.directory_store
+                .allocate_cookie(to_dirid, &mut txn)
+                .await?
+        };
+
+        let embed_inode = if source_inode.nlink() == 1 {
+            Some(&source_inode)
+        } else {
+            None
+        };
+        self.directory_store.add(
+            &mut txn,
+            to_dirid,
+            to_name,
+            source_inode_id,
+            new_cookie,
+            embed_inode,
+        );
+
         self.inode_store
             .save(&mut txn, source_inode_id, &source_inode)?;
 
         let is_moved_dir = matches!(source_inode, Inode::Directory(_));
 
-        // Update directory metadata using already-fetched inodes
         if let Inode::Directory(d) = &mut from_dir {
             if from_dirid != to_dirid {
                 // Moving to different directory: source leaves from_dir
@@ -2646,7 +2689,7 @@ mod tests {
         let fs_rw = ZeroFS::new_with_slatedb(
             crate::encryption::SlateDbHandle::ReadWrite(slatedb),
             test_key,
-            crate::config::FilesystemConfig::DEFAULT_MAX_BYTES,
+            u64::MAX,
         )
         .await
         .unwrap();
@@ -3742,5 +3785,280 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dir_scan_entry_embeds_inode_on_create() {
+        use futures::StreamExt;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        let entry = entries.next().await.unwrap().unwrap();
+
+        assert_eq!(entry.name, b"test.txt");
+        assert_eq!(entry.inode_id, file_id);
+        assert!(
+            entry.inode.is_some(),
+            "Newly created file should have embedded inode"
+        );
+
+        let embedded = entry.inode.unwrap();
+        match embedded {
+            Inode::File(f) => {
+                assert_eq!(f.nlink, 1);
+                assert!(f.parent.is_some());
+                assert!(f.name.is_some());
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dir_scan_entry_updates_on_write() {
+        use futures::StreamExt;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(b"hello world".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        let entry = entries.next().await.unwrap().unwrap();
+
+        let embedded = entry.inode.expect("Should have embedded inode");
+        match embedded {
+            Inode::File(f) => {
+                assert_eq!(f.size, 11, "Embedded inode should have updated size");
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dir_scan_entry_updates_on_setattr() {
+        use futures::StreamExt;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let attrs = SetAttributes {
+            mode: SetMode::Set(0o755),
+            ..Default::default()
+        };
+        fs.setattr(&test_creds(), file_id, &attrs).await.unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        let entry = entries.next().await.unwrap().unwrap();
+
+        let embedded = entry.inode.expect("Should have embedded inode");
+        match embedded {
+            Inode::File(f) => {
+                assert_eq!(
+                    f.mode & 0o777,
+                    0o755,
+                    "Embedded inode should have updated mode"
+                );
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dir_scan_entry_becomes_reference_on_hardlink() {
+        use futures::StreamExt;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        let entry = entries.next().await.unwrap().unwrap();
+        assert!(
+            entry.inode.is_some(),
+            "Before hardlink, should have embedded inode"
+        );
+        drop(entries);
+
+        fs.link(&(&test_auth()).into(), file_id, 0, b"hardlink.txt")
+            .await
+            .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+
+        let entry1 = entries.next().await.unwrap().unwrap();
+        let entry2 = entries.next().await.unwrap().unwrap();
+
+        let (original, hardlink) = if entry1.name == b"original.txt" {
+            (entry1, entry2)
+        } else {
+            (entry2, entry1)
+        };
+
+        assert!(
+            original.inode.is_none(),
+            "Original entry should be Reference after hardlink"
+        );
+        assert!(
+            hardlink.inode.is_none(),
+            "Hardlink entry should be Reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dir_scan_entry_restored_on_rename_over_same_inode() {
+        use futures::StreamExt;
+
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.link(&(&test_auth()).into(), file_id, 0, b"hardlink.txt")
+            .await
+            .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.unwrap();
+            assert!(
+                entry.inode.is_none(),
+                "Both entries should be Reference with nlink=2"
+            );
+        }
+        drop(entries);
+
+        fs.rename(
+            &(&test_auth()).into(),
+            0,
+            b"hardlink.txt",
+            0,
+            b"original.txt",
+        )
+        .await
+        .unwrap();
+
+        let mut entries = fs.directory_store.list(0).await.unwrap();
+        let entry = entries.next().await.unwrap().unwrap();
+
+        assert_eq!(entry.name, b"original.txt");
+        assert!(
+            entry.inode.is_some(),
+            "After rename-over-same-inode (nlink=1), should have embedded inode"
+        );
+
+        // Verify nlink is 1
+        let embedded = entry.inode.unwrap();
+        match embedded {
+            Inode::File(f) => {
+                assert_eq!(f.nlink, 1);
+                assert!(f.parent.is_some(), "parent should be restored");
+                assert!(f.name.is_some(), "name should be restored");
+            }
+            _ => panic!("Expected file inode"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_readdir_uses_embedded_inode() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"test.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(b"test content".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        let result = fs.readdir(&(&test_auth()).into(), 0, 0, 10).await.unwrap();
+
+        let file_entry = result
+            .entries
+            .iter()
+            .find(|e| e.name == b"test.txt")
+            .expect("Should find test.txt");
+
+        assert_eq!(file_entry.fileid, file_id);
+        assert_eq!(
+            file_entry.attr.size, 12,
+            "Should have correct size from embedded inode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_readdir_fetches_inode_for_hardlinks() {
+        let fs = ZeroFS::new_in_memory().await.unwrap();
+
+        let (file_id, _) = fs
+            .create(&test_creds(), 0, b"original.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+
+        fs.write(
+            &(&test_auth()).into(),
+            file_id,
+            0,
+            &Bytes::from(b"test content".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        fs.link(&(&test_auth()).into(), file_id, 0, b"hardlink.txt")
+            .await
+            .unwrap();
+
+        let result = fs.readdir(&(&test_auth()).into(), 0, 0, 10).await.unwrap();
+
+        let original = result
+            .entries
+            .iter()
+            .find(|e| e.name == b"original.txt")
+            .expect("Should find original.txt");
+
+        let hardlink = result
+            .entries
+            .iter()
+            .find(|e| e.name == b"hardlink.txt")
+            .expect("Should find hardlink.txt");
+
+        // Both should have the same inode id and attributes
+        assert_eq!(original.fileid, file_id);
+        assert_eq!(hardlink.fileid, file_id);
+        assert_eq!(original.attr.size, 12);
+        assert_eq!(hardlink.attr.size, 12);
+        assert_eq!(original.attr.nlink, 2);
+        assert_eq!(hardlink.attr.nlink, 2);
     }
 }
